@@ -50,7 +50,7 @@ public static class TheoisticPDFExtensions
             string bitness = (IntPtr.Size == 8) ? "x64" : "x86";
             string fileExtension = (runtimeIdentifier == "win") ? ".dll" : (runtimeIdentifier == "linux" ? ".so" : ".dylib");
 
-            string sideLoadedAsm = Path.Combine(Path.GetDirectoryName(Assembly.GetEntryAssembly().Location),
+            string sideLoadedAsm = Path.Combine(Path.GetDirectoryName(typeof(TheoisticPDFExtensions).Assembly.Location),
                                                 "runtimes",
                                                 $"{runtimeIdentifier}-{bitness}",
                                                 "native",

@@ -13,7 +13,7 @@ Theoistic.PDF is a powerful library for .NET that provides capabilities to build
 You can add Theoistic.PDF to your project via the NuGet package manager. Use the following command in your Package Manager Console:
 
 ```
-Install-Package Theoistic.Theoistic.PDF
+Install-Package Theoistic.PDF
 ```
 
 ## Configuration
