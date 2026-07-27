@@ -636,6 +636,14 @@ public class PechkinPaperSize
 
     public static implicit operator PechkinPaperSize(PaperKind paperKind)
     {
-        return dictionary[paperKind];
+        if (!dictionary.TryGetValue(paperKind, out var size))
+        {
+            throw new ArgumentOutOfRangeException(nameof(paperKind), paperKind,
+                $"No paper dimensions are defined for {paperKind}. Set PaperSize to a new PechkinPaperSize(width, height) instead.");
+        }
+
+        // A copy, so that mutating GlobalSettings.PaperSize cannot rewrite the shared table
+        // and change the dimensions of every other document in the process.
+        return new PechkinPaperSize(size.Width, size.Height);
     }
 }

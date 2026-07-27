@@ -1,4 +1,5 @@
-﻿using System.Collections;
+using System.Collections;
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,24 +14,29 @@ namespace Theoistic.PDF;
 /// - The "." key for current item in a list
 /// Does not fully comply with Mustache spec.
 /// </summary>
-/// <summary>
-/// A simplified Mustache-like renderer. Supports:
-/// - {{variable}} interpolation
-/// - {{#section}} and {{/section}} for lists and bool checks
-/// - {{^section}} and {{/section}} for inverted sections
-/// - The "." key for current item in a list
-/// Does not fully comply with Mustache spec.
-/// </summary>
 public class MustacheRenderer
 {
     private static readonly Regex TagPattern = new Regex(@"{{(.*?)}}", RegexOptions.Compiled);
 
+    private static readonly Regex SectionPattern =
+        new Regex(@"{{[#^]([A-Za-z0-9_\.]+)}}(.*?){{/\1}}", RegexOptions.Singleline | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Guards against templates whose rendered output keeps producing section tags - for example
+    /// when a model value itself contains "{{#x}}". Without it the section loop never terminates.
+    /// </summary>
+    private const int MaxSectionPasses = 10_000;
+
+    private static readonly ConcurrentDictionary<(Type Type, string Name), MemberInfo?> MemberCache = new();
+
     public string Render(string template, object model)
     {
+        ArgumentNullException.ThrowIfNull(template);
+
         return RenderTemplate(template, model);
     }
 
-    private string RenderTemplate(string template, object model)
+    private string RenderTemplate(string template, object? model)
     {
         // First, handle sections
         template = RenderSections(template, model);
@@ -41,14 +47,14 @@ public class MustacheRenderer
         return template;
     }
 
-    private string RenderVariables(string template, object model)
+    private string RenderVariables(string template, object? model)
     {
         return TagPattern.Replace(template, match =>
         {
             string tagContent = match.Groups[1].Value.Trim();
 
             // If it's a section tag, we skip here. Sections are handled separately.
-            if (tagContent.StartsWith("#") || tagContent.StartsWith("^") || tagContent.StartsWith("/"))
+            if (tagContent.StartsWith('#') || tagContent.StartsWith('^') || tagContent.StartsWith('/'))
             {
                 return match.Value;
             }
@@ -58,149 +64,165 @@ public class MustacheRenderer
         });
     }
 
-    private string RenderSections(string template, object model)
+    private string RenderSections(string template, object? model)
     {
-        // A basic approach: find sections {{#section}}...{{/section}} and {{^section}}...{{/section}},
-        // recursively render them.
-        // We'll do this iteratively until no more sections are found.
-
-        // Regex to find the outermost section:
-        // We'll look for a pattern: {{#key}}(.*?){{/key}} or {{^key}}(.*?){{/key}} 
-        // in a non-greedy manner, and attempt to handle nesting by repeatedly applying.
-        var sectionPattern = new Regex(@"{{[#^]([A-Za-z0-9_\.]+)}}(.*?){{/\1}}", RegexOptions.Singleline);
-
+        // Repeatedly replace the first section found. Matching one at a time avoids the full
+        // scan that Matches().Count forces, and the indices stay valid for the single edit.
         string rendered = template;
-        bool foundSection = true;
 
-        while (foundSection)
+        for (int pass = 0; pass < MaxSectionPasses; pass++)
         {
-            foundSection = false;
-            var matches = sectionPattern.Matches(rendered);
-            if (matches.Count == 0) break;
+            Match match = SectionPattern.Match(rendered);
 
-            foreach (Match match in matches)
+            if (!match.Success)
             {
-                foundSection = true;
-                string sectionName = match.Groups[1].Value;
-                string sectionContent = match.Groups[2].Value;
-                bool inverted = match.Value.StartsWith("{{^");
-
-                string replacement = RenderSection(sectionName, sectionContent, model, inverted);
-                rendered = rendered.Substring(0, match.Index) + replacement + rendered.Substring(match.Index + match.Length);
-                break; // After replacement, indices shift, so break and start again
+                return rendered;
             }
+
+            string sectionName = match.Groups[1].Value;
+            string sectionContent = match.Groups[2].Value;
+            bool inverted = match.Value.StartsWith("{{^", StringComparison.Ordinal);
+
+            string replacement = RenderSection(sectionName, sectionContent, model, inverted);
+
+            rendered = string.Concat(
+                rendered.AsSpan(0, match.Index),
+                replacement.AsSpan(),
+                rendered.AsSpan(match.Index + match.Length));
         }
 
-        return rendered;
+        throw new InvalidOperationException(
+            $"Template did not stabilise after {MaxSectionPasses} section passes; it likely contains section tags that re-emerge from the model data.");
     }
 
-    private string RenderSection(string sectionName, string sectionContent, object model, bool inverted)
+    private string RenderSection(string sectionName, string sectionContent, object? model, bool inverted)
     {
-        object value = ResolveModelValue(model, sectionName);
+        object? value = ResolveModelValue(model, sectionName);
 
-        bool shouldRender = ShouldRenderSection(value, inverted);
-        if (!shouldRender)
+        if (!ShouldRenderSection(value, inverted))
         {
             return string.Empty;
         }
 
+        // An inverted section renders its body against the unchanged context.
+        if (inverted)
+        {
+            return RenderTemplate(sectionContent, model);
+        }
+
         // If value is a list, we iterate over each item as a new context
-        if (value is IEnumerable && !(value is string))
+        if (value is IEnumerable enumerable && value is not string)
         {
             var sb = new StringBuilder();
-            foreach (var item in (IEnumerable)value)
+
+            foreach (var item in enumerable)
             {
                 sb.Append(RenderTemplate(sectionContent, item));
             }
+
             return sb.ToString();
         }
-        else if (value is bool boolVal)
+
+        if (value is bool)
         {
-            // For booleans:
-            // true: render section content with the SAME context (don't change model)
-            // false: would never get here, because we already returned if !shouldRender
-            return boolVal ? RenderTemplate(sectionContent, model) : string.Empty;
+            // Only a true value reaches this point, and it renders with the SAME context.
+            return RenderTemplate(sectionContent, model);
         }
-        else if (value != null)
+
+        if (value != null)
         {
             // For non-boolean objects (like another model), use the object as the new context
             return RenderTemplate(sectionContent, value);
         }
-        else
-        {
-            // Null value, but we made it here implies shouldRender is true for some reason.
-            // Typically shouldn't happen if shouldRender is correct. Just return empty.
-            return string.Empty;
-        }
+
+        return string.Empty;
     }
 
-    private bool ShouldRenderSection(object value, bool inverted)
+    private bool ShouldRenderSection(object? value, bool inverted)
     {
-        bool isTruthy = false;
-        if (value == null)
+        bool isTruthy = value switch
         {
-            isTruthy = false;
-        }
-        else if (value is bool b)
-        {
-            isTruthy = b;
-        }
-        else if (value is IEnumerable en && !(value is string))
-        {
+            null => false,
+            bool b => b,
+            string => true,
             // For lists, truthy if not empty
-            isTruthy = en.Cast<object>().Any();
-        }
-        else
-        {
+            IEnumerable en => HasAny(en),
             // Any other non-null object is considered truthy
-            isTruthy = true;
-        }
+            _ => true
+        };
 
         return inverted ? !isTruthy : isTruthy;
     }
 
-    private string LookupValue(object model, string key)
+    private static bool HasAny(IEnumerable source)
+    {
+        if (source is ICollection collection)
+        {
+            return collection.Count > 0;
+        }
+
+        IEnumerator enumerator = source.GetEnumerator();
+
+        try
+        {
+            return enumerator.MoveNext();
+        }
+        finally
+        {
+            (enumerator as IDisposable)?.Dispose();
+        }
+    }
+
+    private string LookupValue(object? model, string key)
     {
         if (model == null) return string.Empty;
-        if (key == ".") return model.ToString();
+        if (key == ".") return model.ToString() ?? string.Empty;
 
-        object val = ResolveModelValue(model, key);
+        object? val = ResolveModelValue(model, key);
         return val?.ToString() ?? string.Empty;
     }
 
-    private object ResolveModelValue(object model, string key)
+    private object? ResolveModelValue(object? model, string key)
     {
         if (model == null) return null;
 
         // Support nested keys using dot notation
         string[] parts = key.Split('.');
-        object current = model;
+        object? current = model;
+
         foreach (var part in parts)
         {
             if (current == null) return null;
 
-            var type = current.GetType();
-
-            // Try property
-            var prop = type.GetProperty(part, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-            if (prop != null)
-            {
-                current = prop.GetValue(current);
-                continue;
-            }
-
-            // Try field
-            var field = type.GetField(part, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-            if (field != null)
-            {
-                current = field.GetValue(current);
-                continue;
-            }
-
-            // If not found, return null
-            return null;
+            current = ResolveMember(current, part);
         }
 
         return current;
+    }
+
+    private static object? ResolveMember(object instance, string name)
+    {
+        // Member lookup by name is the hot path of a render; resolving it once per (type, name)
+        // keeps repeated renders off the reflection tables.
+        MemberInfo? member = MemberCache.GetOrAdd((instance.GetType(), name), static key =>
+        {
+            const BindingFlags Flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase;
+
+            PropertyInfo? prop = key.Type.GetProperty(key.Name, Flags);
+
+            if (prop != null && prop.CanRead && prop.GetIndexParameters().Length == 0)
+            {
+                return prop;
+            }
+
+            return key.Type.GetField(key.Name, Flags);
+        });
+
+        return member switch
+        {
+            PropertyInfo property => property.GetValue(instance),
+            FieldInfo field => field.GetValue(instance),
+            _ => null
+        };
     }
 }

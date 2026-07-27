@@ -1,7 +1,8 @@
 <Project Sdk="MSTest.Sdk/3.6.1">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <!-- Mirrors the library's targets so the native interop is exercised on both runtimes. -->
+    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -14,6 +15,56 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Theoistic.PDF\Theoistic.PDF.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.1" />
+  </ItemGroup>
+
+  <!--
+    A ProjectReference does not carry the native assets that the NuGet package would place under
+    runtimes/<rid>/native, so they are staged here for the end to end conversion tests.
+  -->
+  <ItemGroup>
+    <None Include="..\Theoistic.PDF\Resources\64 Bit\libwkhtmltox.dll"
+          Condition="'$(OS)' == 'Windows_NT'"
+          Link="runtimes\win-x64\native\libwkhtmltox.dll"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Theoistic.PDF\Resources\64 Bit\libwkhtmltox.so"
+          Condition="'$(OS)' != 'Windows_NT'"
+          Link="runtimes\linux-x64\native\libwkhtmltox.so"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="Microsoft.Testing.Extensions.CodeCoverage" Version="18.3.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="Microsoft.Testing.Extensions.TrxReport" Version="2.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="MSTest.Analyzers" Version="4.0.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="MSTest.TestAdapter" Version="4.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="MSTest.TestFramework" Version="4.0.2" />
   </ItemGroup>
 
 </Project>

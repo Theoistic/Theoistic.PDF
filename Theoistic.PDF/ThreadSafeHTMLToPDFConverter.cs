@@ -1,307 +1,617 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Reflection;
 
 namespace Theoistic.PDF;
 
-internal class ThreadSafeHTMLToPDFConverter
+/// <summary>
+/// Marshals every wkhtmltox call onto one dedicated thread, because the native library keeps
+/// global Qt state and is not thread safe.
+/// </summary>
+internal sealed class ThreadSafeHTMLToPDFConverter : IDisposable
 {
-    private readonly PdfTools Tools;
-    public IDocument ProcessingDocument { get; private set; }
-    private Thread conversionThread;
-    private BlockingCollection<Task> conversions = new BlockingCollection<Task>();
-    private bool kill = false;
+    private readonly PdfTools Tools = new PdfTools();
+    private readonly BlockingCollection<ConversionRequest> conversions = new BlockingCollection<ConversionRequest>();
     private readonly object startLock = new object();
 
-    public event EventHandler<PhaseChangedArgs> PhaseChanged;
-    public event EventHandler<ProgressChangedArgs> ProgressChanged;
-    public event EventHandler<FinishedArgs> Finished;
-    public event EventHandler<ErrorArgs> Error;
-    public event EventHandler<WarningArgs> Warning;
+    private Thread? conversionThread;
+    private int disposed;
+
+    // wkhtmltox stores the raw function pointers for the whole lifetime of a converter and calls
+    // them from inside wkhtmltopdf_convert. Passing the method groups directly at the call site
+    // would create throw-away delegates that the GC is free to collect while native code still
+    // holds their thunks, which the runtime reports as
+    // "A callback was made on a garbage collected delegate" and turns into a FailFast.
+    // Holding them in fields for the lifetime of this instance is what keeps the thunks alive.
+    private readonly VoidCallback phaseChangedCallback;
+    private readonly VoidCallback progressChangedCallback;
+    private readonly IntCallback finishedCallback;
+    private readonly StringCallback warningCallback;
+    private readonly StringCallback errorCallback;
+
+    /// <summary>State of the conversion running on the worker thread; only touched from that thread.</summary>
+    private ConversionState? currentState;
+
+    public IDocument? ProcessingDocument => currentState?.Document;
+
+    public event EventHandler<PhaseChangedArgs>? PhaseChanged;
+    public event EventHandler<ProgressChangedArgs>? ProgressChanged;
+    public event EventHandler<FinishedArgs>? Finished;
+    public event EventHandler<ErrorArgs>? Error;
+    public event EventHandler<WarningArgs>? Warning;
 
     public ThreadSafeHTMLToPDFConverter()
     {
-        Tools = new PdfTools();
+        phaseChangedCallback = OnPhaseChanged;
+        progressChangedCallback = OnProgressChanged;
+        finishedCallback = OnFinished;
+        warningCallback = OnWarning;
+        errorCallback = OnError;
     }
 
-    public byte[] Convert(IDocument document)
+    public byte[] Convert(IDocument document) => ConvertAsync(document).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Queues a conversion on the wkhtmltox thread. <paramref name="cancellationToken"/> can only
+    /// drop the request while it is still queued: a conversion that has reached native code cannot
+    /// be interrupted.
+    /// </summary>
+    public Task<byte[]> ConvertAsync(IDocument document, CancellationToken cancellationToken = default)
     {
-        return Invoke(() => ConvertDocument(document));
+        ArgumentNullException.ThrowIfNull(document);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled<byte[]>(cancellationToken);
+        }
+
+        if (!document.GetObjects().Any())
+        {
+            throw new ArgumentException(
+                "No objects is defined in document that was passed. At least one object must be defined.",
+                nameof(document));
+        }
+
+        StartThread();
+
+        var request = new ConversionRequest(document, cancellationToken);
+
+        try
+        {
+            conversions.Add(request);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+        {
+            throw new ObjectDisposedException(nameof(ThreadSafeHTMLToPDFConverter), ex);
+        }
+
+        return request.Completion.Task;
     }
 
     private byte[] ConvertDocument(IDocument document)
     {
-        if (document.GetObjects().Count() == 0)
-        {
-            throw new ArgumentException("No objects is defined in document that was passed. At least one object must be defined.");
-        }
+        var state = new ConversionState(document);
+        currentState = state;
 
-        ProcessingDocument = document;
-
-        byte[] result = new byte[0];
         Tools.Load();
 
-        IntPtr converter = CreateConverter(document);
+        IntPtr converter = IntPtr.Zero;
 
-        //register events
-        Tools.SetPhaseChangedCallback(converter, OnPhaseChanged);
-        Tools.SetProgressChangedCallback(converter, OnProgressChanged);
-        Tools.SetFinishedCallback(converter, OnFinished);
-        Tools.SetWarningCallback(converter, OnWarning);
-        Tools.SetErrorCallback(converter, OnError);
-
-        bool converted = Tools.DoConversion(converter);
-
-        if (converted)
+        try
         {
-            result = Tools.GetConversionResult(converter);
+            converter = CreateConverter(document);
+
+            //register events - the delegates are instance fields, see the note on their declaration
+            Tools.SetPhaseChangedCallback(converter, phaseChangedCallback);
+            Tools.SetProgressChangedCallback(converter, progressChangedCallback);
+            Tools.SetFinishedCallback(converter, finishedCallback);
+            Tools.SetWarningCallback(converter, warningCallback);
+            Tools.SetErrorCallback(converter, errorCallback);
+
+            bool converted = Tools.DoConversion(converter);
+
+            if (!converted)
+            {
+                throw new PdfConversionException(
+                    BuildFailureMessage(state, Tools.GetHttpErrorCode(converter)),
+                    state.Errors,
+                    state.Warnings);
+            }
+
+            byte[] result = Tools.GetConversionResult(converter);
+
+            // With GlobalSettings.Out set, wkhtmltox writes the file itself and leaves the output
+            // buffer empty, so only an unrequested empty buffer means something went wrong.
+            if (result.Length == 0 && !state.WritesToFile)
+            {
+                throw new PdfConversionException(
+                    BuildFailureMessage(state, Tools.GetHttpErrorCode(converter)),
+                    state.Errors,
+                    state.Warnings);
+            }
+
+            return result;
+        }
+        finally
+        {
+            // Always released, including when CreateConverter or the conversion itself threw,
+            // otherwise every failure leaks the native converter and its settings.
+            Tools.DestroyConverter(converter);
+            currentState = null;
+        }
+    }
+
+    private static string BuildFailureMessage(ConversionState state, int httpErrorCode)
+    {
+        var message = "wkhtmltopdf failed to convert the document.";
+
+        if (httpErrorCode != 0)
+        {
+            message += $" HTTP error code: {httpErrorCode}.";
         }
 
-        Tools.DestroyConverter(converter);
+        if (state.Errors.Count > 0)
+        {
+            message += " Errors: " + string.Join("; ", state.Errors) + ".";
+        }
 
-        return result;
+        if (state.Warnings.Count > 0)
+        {
+            message += " Warnings: " + string.Join("; ", state.Warnings) + ".";
+        }
+
+        if (state.RejectedSettings.Count > 0)
+        {
+            message += " Settings rejected by wkhtmltox: " + string.Join("; ", state.RejectedSettings) + ".";
+        }
+
+        return message;
     }
+
+    // Native code calls the five methods below. An exception escaping into a native frame is
+    // undefined behaviour, so each one swallows everything a handler may throw.
 
     private void OnPhaseChanged(IntPtr converter)
     {
-        int currentPhase = Tools.GetCurrentPhase(converter);
-        var eventArgs = new PhaseChangedArgs()
+        try
         {
-            Document = ProcessingDocument,
-            PhaseCount = Tools.GetPhaseCount(converter),
-            CurrentPhase = currentPhase,
-            Description = Tools.GetPhaseDescription(converter, currentPhase)
-        };
+            var handler = PhaseChanged;
+            if (handler == null)
+            {
+                return;
+            }
 
-        PhaseChanged?.Invoke(this, eventArgs);
+            int currentPhase = Tools.GetCurrentPhase(converter);
+
+            handler(this, new PhaseChangedArgs
+            {
+                Document = currentState?.Document,
+                PhaseCount = Tools.GetPhaseCount(converter),
+                CurrentPhase = currentPhase,
+                Description = Tools.GetPhaseDescription(converter, currentPhase)
+            });
+        }
+        catch
+        {
+            // never let a managed exception unwind into wkhtmltox
+        }
     }
 
     private void OnProgressChanged(IntPtr converter)
     {
-        var eventArgs = new ProgressChangedArgs()
+        try
         {
-            Document = ProcessingDocument,
-            Description = Tools.GetProgressString(converter)
-        };
+            var handler = ProgressChanged;
+            if (handler == null)
+            {
+                return;
+            }
 
-        ProgressChanged?.Invoke(this, eventArgs);
+            handler(this, new ProgressChangedArgs
+            {
+                Document = currentState?.Document,
+                Description = Tools.GetProgressString(converter)
+            });
+        }
+        catch
+        {
+        }
     }
 
     private void OnFinished(IntPtr converter, int success)
     {
-        var eventArgs = new FinishedArgs()
+        try
         {
-            Document = ProcessingDocument,
-            Success = success == 1 ? true : false
-        };
-
-        Finished?.Invoke(this, eventArgs);
+            Finished?.Invoke(this, new FinishedArgs
+            {
+                Document = currentState?.Document,
+                Success = success == 1
+            });
+        }
+        catch
+        {
+        }
     }
 
     private void OnError(IntPtr converter, string message)
     {
-        var eventArgs = new ErrorArgs()
+        try
         {
-            Document = ProcessingDocument,
-            Message = message
-        };
+            currentState?.Errors.Add(message);
 
-        Error?.Invoke(this, eventArgs);
+            Error?.Invoke(this, new ErrorArgs
+            {
+                Document = currentState?.Document,
+                Message = message
+            });
+        }
+        catch
+        {
+        }
     }
 
     private void OnWarning(IntPtr converter, string message)
     {
-        var eventArgs = new WarningArgs()
+        try
         {
-            Document = ProcessingDocument,
-            Message = message
-        };
+            currentState?.Warnings.Add(message);
 
-        Warning?.Invoke(this, eventArgs);
+            Warning?.Invoke(this, new WarningArgs
+            {
+                Document = currentState?.Document,
+                Message = message
+            });
+        }
+        catch
+        {
+        }
     }
 
     private IntPtr CreateConverter(IDocument document)
     {
-        IntPtr converter = IntPtr.Zero;
+        IntPtr globalSettings = Tools.CreateGlobalSettings();
+        IntPtr converter;
 
+        try
         {
-            IntPtr settings = Tools.CreateGlobalSettings();
+            ApplyConfig(globalSettings, document, true);
 
-            ApplyConfig(settings, document, true);
-
-            converter = Tools.CreateConverter(settings);
+            // wkhtmltopdf_create_converter takes ownership of the global settings.
+            converter = Tools.CreateConverter(globalSettings);
+            globalSettings = IntPtr.Zero;
+        }
+        catch
+        {
+            Tools.DestroyGlobalSetting(globalSettings);
+            throw;
         }
 
-        foreach (var obj in document.GetObjects())
+        if (converter == IntPtr.Zero)
         {
-            if (obj != null)
+            throw new PdfConversionException("wkhtmltopdf_create_converter returned a null converter.");
+        }
+
+        try
+        {
+            foreach (var obj in document.GetObjects())
             {
-                IntPtr settings = Tools.CreateObjectSettings();
+                if (obj == null)
+                {
+                    continue;
+                }
 
-                ApplyConfig(settings, obj, false);
+                IntPtr objectSettings = Tools.CreateObjectSettings();
 
-                Tools.AddObject(converter, settings, obj.GetContent());
+                try
+                {
+                    ApplyConfig(objectSettings, obj, false);
+                }
+                catch
+                {
+                    Tools.DestroyObjectSetting(objectSettings);
+                    throw;
+                }
+
+                // wkhtmltopdf_add_object takes ownership of the object settings.
+                Tools.AddObject(converter, objectSettings, obj.GetContent());
             }
+        }
+        catch
+        {
+            Tools.DestroyConverter(converter);
+            throw;
         }
 
         return converter;
     }
 
-    private void ApplyConfig(IntPtr config, ISettings settings, bool isGlobal)
+    private void ApplyConfig(IntPtr config, ISettings? settings, bool isGlobal)
     {
         if (settings == null)
         {
             return;
         }
 
-        var bindingFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-
-        var props = settings.GetType().GetProperties(bindingFlags);
-
-        foreach (var prop in props)
+        foreach (var accessor in SettingsMetadata.For(settings.GetType()))
         {
-            Attribute[] attrs = (Attribute[])prop.GetCustomAttributes();
-            object propValue = prop.GetValue(settings);
+            object? propValue = accessor.Property.GetValue(settings);
 
             if (propValue == null)
             {
                 continue;
             }
-            else if (attrs.Length > 0 && attrs[0] is WkHtmlAttribute)
-            {
-                var attr = attrs[0] as WkHtmlAttribute;
 
-                Apply(config, attr.Name, propValue, isGlobal);
-            }
-            else if (propValue is ISettings)
+            if (accessor.WkHtmlName != null)
             {
-                ApplyConfig(config, propValue as ISettings, isGlobal);
+                Apply(config, accessor.WkHtmlName, propValue, isGlobal);
             }
-
+            else if (propValue is ISettings nested)
+            {
+                ApplyConfig(config, nested, isGlobal);
+            }
         }
     }
 
     private void Apply(IntPtr config, string name, object value, bool isGlobal)
     {
-        var type = value.GetType();
+        switch (value)
+        {
+            case bool boolValue:
+                SetSetting(config, name, boolValue ? "true" : "false", isGlobal);
+                break;
 
-        Func<IntPtr, string, string, int> applySetting;
-        if (isGlobal)
-        {
-            applySetting = Tools.SetGlobalSetting;
-        }
-        else
-        {
-            applySetting = Tools.SetObjectSetting;
-        }
+            case double doubleValue:
+                SetSetting(config, name, doubleValue.ToString("0.##", CultureInfo.InvariantCulture), isGlobal);
+                break;
 
-        if (typeof(bool) == type)
-        {
-            applySetting(config, name, ((bool)value == true ? "true" : "false"));
-        }
-        else if (typeof(double) == type)
-        {
-            applySetting(config, name, ((double)value).ToString("0.##", CultureInfo.InvariantCulture));
-        }
-        else if (typeof(Dictionary<string, string>).IsAssignableFrom(type))
-        {
-            var dictionary = (Dictionary<string, string>)value;
-            int index = 0;
+            case string stringValue:
+                SetSetting(config, name, stringValue, isGlobal);
+                break;
 
-            foreach (var pair in dictionary)
-            {
-                if (pair.Key == null || pair.Value == null)
+            case Dictionary<string, string> dictionary:
+                int index = 0;
+
+                foreach (var pair in dictionary)
                 {
-                    continue;
+                    if (pair.Key == null || pair.Value == null)
+                    {
+                        continue;
+                    }
+
+                    //https://github.com/wkhtmltopdf/wkhtmltopdf/blob/c754e38b074a75a51327df36c4a53f8962020510/src/lib/reflect.hh#L192
+                    SetSetting(config, name + ".append", null, isGlobal);
+                    SetSetting(config, string.Format(CultureInfo.InvariantCulture, "{0}[{1}]", name, index), pair.Key + "\n" + pair.Value, isGlobal);
+
+                    index++;
                 }
+                break;
 
-                //https://github.com/wkhtmltopdf/wkhtmltopdf/blob/c754e38b074a75a51327df36c4a53f8962020510/src/lib/reflect.hh#L192
-                applySetting(config, name + ".append", null);
-                applySetting(config, string.Format("{0}[{1}]", name, index), pair.Key + "\n" + pair.Value);
+            // Numbers must not pick up the ambient culture's sign or digit shapes.
+            case IFormattable formattable:
+                SetSetting(config, name, formattable.ToString(null, CultureInfo.InvariantCulture), isGlobal);
+                break;
 
-                index++;
-            }
-        }
-        else
-        {
-            applySetting(config, name, value.ToString());
+            default:
+                SetSetting(config, name, value.ToString(), isGlobal);
+                break;
         }
     }
 
-    public TResult Invoke<TResult>(Func<TResult> @delegate)
+    private void SetSetting(IntPtr config, string name, string? value, bool isGlobal)
     {
-        StartThread();
+        int applied;
 
-        Task<TResult> task = new Task<TResult>(@delegate);
-
-        lock (task)
+        if (isGlobal)
         {
-            //add task to blocking collection
-            conversions.Add(task);
+            if (name == "out" && !string.IsNullOrEmpty(value) && currentState != null)
+            {
+                currentState.WritesToFile = true;
+            }
 
-            //wait for task to be processed by conversion thread 
-            Monitor.Wait(task);
+            applied = Tools.SetGlobalSetting(config, name, value);
+        }
+        else
+        {
+            applied = Tools.SetObjectSetting(config, name, value);
         }
 
-        //throw exception that happened during conversion
-        if (task.Exception != null)
+        // wkhtmltox answers 0 for a setting name it does not know or a value it cannot parse, and
+        // then just carries on with the default. Recording it turns a silently ignored option
+        // into something the caller can actually see when the conversion misbehaves.
+        if (applied != 1)
         {
-            throw task.Exception;
+            currentState?.RejectedSettings.Add($"{name}={value ?? "<null>"}");
         }
-
-        return task.Result;
     }
 
     private void StartThread()
     {
+        if (Volatile.Read(ref conversionThread) != null)
+        {
+            return;
+        }
+
         lock (startLock)
         {
             if (conversionThread == null)
             {
-                conversionThread = new Thread(Run)
+                var thread = new Thread(Run)
                 {
                     IsBackground = true,
                     Name = "wkhtmltopdf worker thread"
                 };
 
-                kill = false;
+                thread.Start();
 
-                conversionThread.Start();
-            }
-        }
-    }
-
-    private void StopThread()
-    {
-        lock (startLock)
-        {
-            if (conversionThread != null)
-            {
-                kill = true;
-
-                while (conversionThread.ThreadState == ThreadState.Stopped)
-                { }
-
-                conversionThread = null;
+                Volatile.Write(ref conversionThread, thread);
             }
         }
     }
 
     private void Run()
     {
-        while (!kill)
+        try
         {
-            //get next conversion taks from blocking collection
-            Task task = conversions.Take();
-
-            lock (task)
+            foreach (var request in conversions.GetConsumingEnumerable())
             {
-                //run taks on thread that called RunSynchronously method
-                task.RunSynchronously();
+                if (request.CancellationToken.IsCancellationRequested)
+                {
+                    request.Completion.TrySetCanceled(request.CancellationToken);
+                    continue;
+                }
 
-                //notify caller thread that task is completed
-                Monitor.Pulse(task);
+                try
+                {
+                    request.Completion.TrySetResult(ConvertDocument(request.Document));
+                }
+                catch (Exception ex)
+                {
+                    request.Completion.TrySetException(ex);
+                }
             }
         }
+        finally
+        {
+            // Nothing else may be waiting on these, and init/deinit have to happen on this thread.
+            FailPendingRequests();
+
+            try
+            {
+                Tools.Dispose();
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private void FailPendingRequests()
+    {
+        while (conversions.TryTake(out var pending))
+        {
+            pending.Completion.TrySetException(
+                new ObjectDisposedException(nameof(ThreadSafeHTMLToPDFConverter),
+                    "The PDF converter was disposed before this conversion could run."));
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
+        conversions.CompleteAdding();
+
+        Thread? thread = Volatile.Read(ref conversionThread);
+
+        if (thread == null)
+        {
+            // The worker never started, so nothing will deinit wkhtmltox or drain the queue.
+            FailPendingRequests();
+            conversions.Dispose();
+            return;
+        }
+
+        // A conversion already inside native code cannot be interrupted. Long enough for one in
+        // flight to finish, short enough not to dominate host shutdown; if it does outlive the
+        // wait the queue is left alone rather than disposed underneath the worker, and the thread
+        // is a background thread so it will not hold the process open.
+        if (thread.Join(TimeSpan.FromSeconds(10)))
+        {
+            conversions.Dispose();
+        }
+    }
+
+    private sealed class ConversionRequest
+    {
+        public ConversionRequest(IDocument document, CancellationToken cancellationToken)
+        {
+            Document = document;
+            CancellationToken = cancellationToken;
+        }
+
+        public IDocument Document { get; }
+
+        public CancellationToken CancellationToken { get; }
+
+        // Continuations must not run inline on the wkhtmltox thread.
+        public TaskCompletionSource<byte[]> Completion { get; } =
+            new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private sealed class ConversionState
+    {
+        public ConversionState(IDocument document) => Document = document;
+
+        public IDocument Document { get; }
+
+        public List<string> Errors { get; } = new List<string>();
+
+        public List<string> Warnings { get; } = new List<string>();
+
+        /// <summary>Settings wkhtmltox refused, which it would otherwise ignore in silence.</summary>
+        public List<string> RejectedSettings { get; } = new List<string>();
+
+        /// <summary>Set when GlobalSettings.Out asked wkhtmltox to write the file itself.</summary>
+        public bool WritesToFile { get; set; }
+    }
+
+    /// <summary>
+    /// Per-type cache of the settings properties wkhtmltox cares about. Without it every
+    /// conversion re-walks the reflection metadata of every settings object.
+    /// </summary>
+    private static class SettingsMetadata
+    {
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, SettingAccessor[]> cache = new();
+
+        public static SettingAccessor[] For(Type type) => cache.GetOrAdd(type, Build);
+
+        private static SettingAccessor[] Build(Type type)
+        {
+            const BindingFlags Flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            var accessors = new List<SettingAccessor>();
+
+            foreach (var prop in type.GetProperties(Flags))
+            {
+                if (!prop.CanRead || prop.GetIndexParameters().Length != 0)
+                {
+                    continue;
+                }
+
+                // Looking the attribute up by type is order independent; indexing into
+                // GetCustomAttributes() would miss it whenever the compiler emits its own
+                // attributes (for example [Nullable]) ahead of it.
+                var attribute = prop.GetCustomAttribute<WkHtmlAttribute>(inherit: true);
+
+                if (attribute != null)
+                {
+                    accessors.Add(new SettingAccessor(prop, attribute.Name));
+                }
+                else if (typeof(ISettings).IsAssignableFrom(prop.PropertyType))
+                {
+                    accessors.Add(new SettingAccessor(prop, null));
+                }
+            }
+
+            return accessors.ToArray();
+        }
+    }
+
+    private readonly struct SettingAccessor
+    {
+        public SettingAccessor(PropertyInfo property, string? wkHtmlName)
+        {
+            Property = property;
+            WkHtmlName = wkHtmlName;
+        }
+
+        public PropertyInfo Property { get; }
+
+        /// <summary>The wkhtmltox setting name, or <see langword="null"/> for a nested settings object.</summary>
+        public string? WkHtmlName { get; }
     }
 }
