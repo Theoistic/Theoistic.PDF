@@ -1,13 +1,13 @@
-﻿using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Text;
+﻿using System.Text;
 using Microsoft.Extensions.DependencyInjection;
+using Theoistic.PDF.Rendering;
 
 namespace Theoistic.PDF.Tests;
 
 /// <summary>
-/// End to end coverage over the native wkhtmltox path: P/Invoke signatures, UTF-8 marshalling,
-/// settings reflection and - most importantly - the lifetime of the conversion callbacks.
+/// Covers the builder. The settings plumbing is exercised against a stub renderer so it runs
+/// anywhere; the end-to-end tests drive a real browser and report themselves inconclusive when
+/// none is installed, because an absent browser is a property of the machine rather than a bug.
 /// </summary>
 [TestClass]
 public sealed class PDFBuilderTests
@@ -18,262 +18,528 @@ public sealed class PDFBuilderTests
         <body><h1>Hello</h1><p>Some content to lay out.</p></body></html>
         """;
 
+    private static string? browserPath;
+
     [ClassInitialize]
     public static void Initialize(TestContext _)
     {
-        var services = new ServiceCollection();
-        services.AddTheoisticPDF();
-        services.BuildServiceProvider().UseTheoisticPDF();
+        browserPath = ChromiumLocator.Find();
+    }
+
+    private static void RequireBrowser()
+    {
+        if (browserPath is null)
+        {
+            Assert.Inconclusive(
+                "No Chromium-family browser is installed, so the end-to-end path cannot run here. " +
+                $"Probed: {string.Join(", ", ChromiumLocator.ProbedLocations())}");
+        }
     }
 
     private static void AssertIsPdf(byte[] bytes)
     {
-        Assert.IsTrue(bytes.Length > 0, "conversion produced no bytes");
+        Assert.IsTrue(bytes.Length > 0, "render produced no bytes");
         Assert.AreEqual("%PDF", Encoding.ASCII.GetString(bytes, 0, 4), "output is not a PDF");
     }
 
-    private static async Task<TException> AssertThrowsAsync<TException>(Func<Task> action)
-        where TException : Exception
-    {
-        try
-        {
-            await action();
-        }
-        catch (TException expected)
-        {
-            return expected;
-        }
-        catch (Exception unexpected)
-        {
-            Assert.Fail($"Expected {typeof(TException).Name} but got {unexpected.GetType().Name}: {unexpected.Message}");
-        }
-
-        Assert.Fail($"Expected {typeof(TException).Name} but no exception was thrown.");
-        return null!;
-    }
-
-    [TestMethod]
-    public async Task BuildAsync_ProducesAPdf()
-    {
-        using var builder = new PDFBuilder();
-
-        AssertIsPdf(await builder.BuildAsync(Html));
-    }
-
     /// <summary>
-    /// Guards the fix for "A callback was made on a garbage collected delegate of type
-    /// 'Theoistic.PDF!Theoistic.PDF.VoidCallback::Invoke'". wkhtmltox holds the raw thunks for the
-    /// whole conversion, so the delegates must be rooted for at least that long. Passing the method
-    /// groups at the call site instead only survives while tier 0 codegen happens to keep the
-    /// temporaries alive in the frame - once the method is re-jitted at tier 1 the delegates become
-    /// collectible mid-conversion and the process is torn down by FailFast.
-    /// <para>
-    /// The stress test below is a smoke test, not a deterministic reproduction: reproducing on
-    /// demand needs DOTNET_TieredCompilation=0 as well. This one pins the invariant directly.
-    /// </para>
+    /// Records what the builder passed down and returns a syntactically valid stub, so the
+    /// builder's own behaviour can be tested without a browser.
     /// </summary>
-    [TestMethod]
-    public void Converter_RootsItsNativeCallbacksForItsWholeLifetime()
+    private sealed class StubRenderer : IPdfRenderer
     {
-        var converterType = typeof(PDFBuilder).Assembly
-            .GetType("Theoistic.PDF.ThreadSafeHTMLToPDFConverter", throwOnError: true)!;
+        public GlobalSettings? Global { get; private set; }
 
-        // Only the interop delegates matter here; the event backing fields are delegates too.
-        var delegateFields = converterType
-            .GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
-            .Where(f => f.FieldType.IsDefined(typeof(UnmanagedFunctionPointerAttribute), inherit: false))
-            .ToArray();
+        public ObjectSettings? Content { get; private set; }
 
-        Assert.AreEqual(5, delegateFields.Length,
-            "each wkhtmltox callback needs a field holding it alive; found: " +
-            string.Join(", ", delegateFields.Select(f => f.Name)));
+        public int Calls { get; private set; }
 
-        var converter = Activator.CreateInstance(converterType, nonPublic: true)!;
-
-        foreach (var field in delegateFields)
+        public Task<byte[]> RenderAsync(
+            GlobalSettings global,
+            ObjectSettings content,
+            CancellationToken cancellationToken = default)
         {
-            Assert.IsNotNull(field.GetValue(converter),
-                $"{field.Name} must be assigned in the constructor, not at the registration call site");
+            cancellationToken.ThrowIfCancellationRequested();
+
+            Global = global;
+            Content = content;
+            Calls++;
+
+            return Task.FromResult(Encoding.ASCII.GetBytes("%PDF-1.7\nstub\n%%EOF\n"));
         }
+
+        public Task<PdfRendererStatus> CheckAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new PdfRendererStatus(true, "stub"));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    /// <summary>
-    /// Runs real conversions while a second thread forces collections, so the callbacks have to
-    /// survive a GC that lands mid-conversion.
-    /// </summary>
+    // ---------------------------------------------------------------- builder plumbing
+
     [TestMethod]
-    public async Task BuildAsync_SurvivesGarbageCollectionDuringConversion()
+    public async Task BuildAsync_PassesTheHtmlToTheRenderer()
     {
-        using var pressure = new CancellationTokenSource();
+        var stub = new StubRenderer();
+        using var builder = new PDFBuilder(stub);
 
-        var allocator = Task.Run(() =>
-        {
-            while (!pressure.IsCancellationRequested)
-            {
-                for (int i = 0; i < 200; i++)
-                {
-                    _ = new byte[85_000]; // straight onto the LOH to provoke gen2 collections
-                }
+        await builder.BuildAsync(Html);
 
-                GC.Collect(2, GCCollectionMode.Forced, blocking: false);
-            }
-        });
-
-        try
-        {
-            for (int i = 0; i < 15; i++)
-            {
-                using var builder = new PDFBuilder();
-
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                GC.Collect();
-
-                AssertIsPdf(await builder.BuildAsync($"{Html}<!-- {i} -->"));
-            }
-        }
-        finally
-        {
-            pressure.Cancel();
-            await allocator;
-        }
-    }
-
-    /// <summary>
-    /// Conversions are serialised onto one native thread; concurrent callers must all get their
-    /// own result back rather than deadlocking or crossing streams.
-    /// </summary>
-    [TestMethod]
-    public async Task BuildAsync_HandlesConcurrentCallers()
-    {
-        var results = await Task.WhenAll(Enumerable.Range(0, 8).Select(async i =>
-        {
-            using var builder = new PDFBuilder();
-            return await builder.BuildAsync($"<html><body><h1>Document {i}</h1></body></html>");
-        }));
-
-        foreach (var result in results)
-        {
-            AssertIsPdf(result);
-        }
-    }
-
-    /// <summary>
-    /// Content is handed to wkhtmltox as a NUL terminated UTF-8 buffer; a missing terminator or a
-    /// wrong encoding shows up here as truncated or mangled output.
-    /// </summary>
-    [TestMethod]
-    public async Task BuildAsync_HandlesNonAsciiContent()
-    {
-        using var builder = new PDFBuilder();
-
-        var html = "<html><head><meta charset=\"utf-8\"></head><body><p>æøå ünïcode 日本語 — ✓</p></body></html>";
-
-        AssertIsPdf(await builder.BuildAsync(html));
+        Assert.AreEqual(1, stub.Calls);
+        Assert.AreEqual(Html, stub.Content!.HtmlContent);
     }
 
     [TestMethod]
     public async Task BuildAsync_AppliesSettingsWithoutLosingDefaults()
     {
-        using var builder = new PDFBuilder();
+        var stub = new StubRenderer();
+        using var builder = new PDFBuilder(stub);
 
-        builder.Settings(s =>
-        {
-            s.DPI = 300;
-            s.Margins = new MarginSettings(10, 10, 10, 10);
-        });
+        await builder
+            .Settings(s => s.Margins = new MarginSettings { Unit = Unit.Inches, Top = 1 })
+            .BuildAsync(Html);
 
-        var pdf = await builder.BuildAsync(Html, o =>
-        {
-            o.LoadSettings.LoadErrorHandling = ContentErrorHandling.Ignore;
-            o.WebSettings.PrintMediaType = true;
-        });
-
-        AssertIsPdf(pdf);
+        // The action mutates the defaults rather than replacing them, so A4 and portrait survive.
+        Assert.AreEqual(Orientation.Portrait, stub.Global!.Orientation);
+        Assert.AreEqual("210mm", stub.Global.PaperSize!.Width);
+        Assert.AreEqual(1, stub.Global.Margins.Top);
+        Assert.AreEqual(Unit.Inches, stub.Global.Margins.Unit);
     }
 
-    /// <summary>
-    /// A conversion that wkhtmltox refuses used to come back as a zero byte array that callers
-    /// happily wrote out as a corrupt "PDF".
-    /// </summary>
     [TestMethod]
-    public async Task BuildAsync_ThrowsWithNativeDiagnosticsWhenConversionFails()
+    public async Task BuildAsync_KeepsTheUtf8EncodingDefaultOnObjectSettings()
     {
-        using var builder = new PDFBuilder();
+        var stub = new StubRenderer();
+        using var builder = new PDFBuilder(stub);
 
-        builder.Settings(s => s.Out = Path.Combine("Z:", "definitely", "not", "here", "out.pdf"));
+        await builder.BuildAsync(Html, o => o.LoadSettings.JSDelay = 0);
 
-        var ex = await AssertThrowsAsync<PdfConversionException>(
-            async () => await builder.BuildAsync(Html));
-
-        Assert.IsTrue(ex.Errors.Count > 0, "the native error callback output should be captured");
-        StringAssert.Contains(ex.Message, "Unable to write to destination");
+        Assert.AreEqual("utf-8", stub.Content!.WebSettings.DefaultEncoding);
+        Assert.AreEqual(0, stub.Content.LoadSettings.JSDelay);
     }
 
-    /// <summary>
-    /// wkhtmltox only recognises the lower case CLI spellings of loadErrorHandling; given the enum
-    /// name verbatim it rejects the value and silently falls back to abort. Empty content is a load
-    /// failure, so the two halves below only diverge when the value actually gets through.
-    /// </summary>
-    [TestMethod]
-    public async Task BuildAsync_HonoursIgnoreLoadErrorHandling()
-    {
-        using (var aborting = new PDFBuilder())
-        {
-            await AssertThrowsAsync<PdfConversionException>(async () => await aborting.BuildAsync(""));
-        }
-
-        using var ignoring = new PDFBuilder();
-
-        var pdf = await ignoring.BuildAsync("", o => o.LoadSettings.LoadErrorHandling = ContentErrorHandling.Ignore);
-
-        AssertIsPdf(pdf);
-    }
-
-    /// <summary>
-    /// With GlobalSettings.Out set wkhtmltox writes the file itself and hands back an empty
-    /// buffer, which must not be mistaken for a failure.
-    /// </summary>
     [TestMethod]
     public async Task BuildAsync_WritesToFileWhenOutIsSet()
     {
-        var path = Path.Combine(Path.GetTempPath(), $"theoistic-{Guid.NewGuid():N}.pdf");
+        string path = Path.Combine(Path.GetTempPath(), $"out-{Guid.NewGuid():N}.pdf");
+        var stub = new StubRenderer();
+
+        using var builder = new PDFBuilder(stub);
 
         try
         {
-            using var builder = new PDFBuilder();
+            byte[] returned = await builder.Settings(s => s.Out = path).BuildAsync(Html);
 
-            builder.Settings(s => s.Out = path);
-
-            var result = await builder.BuildAsync(Html);
-
-            Assert.AreEqual(0, result.Length, "output went to the file, not the buffer");
-            Assert.IsTrue(File.Exists(path), "the PDF should have been written to disk");
-            AssertIsPdf(await File.ReadAllBytesAsync(path));
+            Assert.IsTrue(File.Exists(path), "the file named by Out was not written");
+            CollectionAssert.AreEqual(returned, await File.ReadAllBytesAsync(path));
         }
         finally
         {
-            if (File.Exists(path)) File.Delete(path);
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
+    public async Task InjectCSS_PutsTheLinkBeforeTheClosingHead()
+    {
+        string css = Path.Combine(Path.GetTempPath(), $"style-{Guid.NewGuid():N}.css");
+
+        await File.WriteAllTextAsync(css, "body { color: red }");
+
+        var stub = new StubRenderer();
+        using var builder = new PDFBuilder(stub);
+
+        try
+        {
+            await builder.InjectCSS(css).BuildAsync(Html);
+
+            string html = stub.Content!.HtmlContent!;
+            int link = html.IndexOf("<link", StringComparison.Ordinal);
+            int head = html.IndexOf("</head>", StringComparison.Ordinal);
+
+            Assert.IsTrue(link > 0, "no stylesheet link was injected");
+            Assert.IsTrue(link < head, "the link was injected after the closing head tag");
+            Assert.IsTrue(html.Contains("style-", StringComparison.Ordinal), "the link does not name the file");
+        }
+        finally
+        {
+            File.Delete(css);
+        }
+    }
+
+    [TestMethod]
+    public async Task InjectCSS_AppliesToEveryMediaNotJustScreen()
+    {
+        string css = Path.Combine(Path.GetTempPath(), $"style-{Guid.NewGuid():N}.css");
+
+        await File.WriteAllTextAsync(css, "body { color: red }");
+
+        var stub = new StubRenderer();
+        using var builder = new PDFBuilder(stub);
+
+        try
+        {
+            await builder.InjectCSS(css).BuildAsync(Html);
+
+            string html = stub.Content!.HtmlContent!;
+
+            // A screen-only stylesheet is ignored while print media is being rendered, which is
+            // what printing does - the injected CSS would silently do nothing.
+            Assert.IsTrue(html.Contains("media=\"all\"", StringComparison.Ordinal), html);
+            Assert.IsFalse(html.Contains("media=\"screen\"", StringComparison.Ordinal), "the link is screen-only");
+        }
+        finally
+        {
+            File.Delete(css);
+        }
+    }
+
+    [TestMethod]
+    public void InjectCSS_RejectsAMissingFile()
+    {
+        using var builder = new PDFBuilder(new StubRenderer());
+
+        Assert.ThrowsException<FileNotFoundException>(
+            () => builder.InjectCSS(Path.Combine(Path.GetTempPath(), "no-such-file.css")));
+    }
+
+    [TestMethod]
+    public async Task BuildAsync_InjectsIntoAFragmentWithNoHead()
+    {
+        string css = Path.Combine(Path.GetTempPath(), $"style-{Guid.NewGuid():N}.css");
+
+        await File.WriteAllTextAsync(css, "p { margin: 0 }");
+
+        var stub = new StubRenderer();
+        using var builder = new PDFBuilder(stub);
+
+        try
+        {
+            await builder.InjectCSS(css).BuildAsync("<p>bare fragment</p>");
+
+            Assert.IsTrue(stub.Content!.HtmlContent!.StartsWith("<link", StringComparison.Ordinal));
+        }
+        finally
+        {
+            File.Delete(css);
         }
     }
 
     [TestMethod]
     public async Task BuildAsync_RejectsNullHtml()
     {
-        using var builder = new PDFBuilder();
+        using var builder = new PDFBuilder(new StubRenderer());
 
-        await AssertThrowsAsync<ArgumentNullException>(async () => await builder.BuildAsync(null!));
+        await Assert.ThrowsExceptionAsync<ArgumentNullException>(() => builder.BuildAsync(null!));
     }
 
     [TestMethod]
-    public async Task BuildAsync_CancelsWhileQueued()
+    public async Task BuildAsync_AfterDisposeIsRejected()
     {
-        using var builder = new PDFBuilder();
-        using var cts = new CancellationTokenSource();
+        var builder = new PDFBuilder(new StubRenderer());
 
-        cts.Cancel();
+        builder.Dispose();
 
-        await AssertThrowsAsync<OperationCanceledException>(
-            async () => await builder.BuildAsync(Html, null, cts.Token));
+        await Assert.ThrowsExceptionAsync<ObjectDisposedException>(() => builder.BuildAsync(Html));
+    }
+
+    [TestMethod]
+    public async Task BuildAsync_HonoursCancellation()
+    {
+        using var builder = new PDFBuilder(new StubRenderer());
+        using var cancelled = new CancellationTokenSource();
+
+        await cancelled.CancelAsync();
+
+        await Assert.ThrowsExceptionAsync<OperationCanceledException>(
+            () => builder.BuildAsync(Html, null, cancelled.Token));
+    }
+
+    [TestMethod]
+    public void Constructor_WithoutInitialisationExplainsWhatIsMissing()
+    {
+        IServiceProvider? saved = TheoisticPDFExtensions.ServiceProvider;
+
+        TheoisticPDFExtensions.ServiceProvider = null;
+
+        try
+        {
+            InvalidOperationException error = Assert.ThrowsException<InvalidOperationException>(() => new PDFBuilder());
+
+            Assert.IsTrue(error.Message.Contains("AddTheoisticPDF", StringComparison.Ordinal), error.Message);
+        }
+        finally
+        {
+            TheoisticPDFExtensions.ServiceProvider = saved;
+        }
+    }
+
+    // ---------------------------------------------------------------- registration
+
+    [TestMethod]
+    public void AddTheoisticPDF_RegistersTheRendererAsASingleton()
+    {
+        var services = new ServiceCollection();
+
+        services.AddTheoisticPDF();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+
+        var first = provider.GetRequiredService<IPdfRenderer>();
+        var second = provider.GetRequiredService<IPdfRenderer>();
+
+        Assert.IsInstanceOfType<ChromiumRenderer>(first);
+
+        // One browser is shared across renders; a transient registration would start one per
+        // request and cost more than the render itself.
+        Assert.AreSame(first, second);
+    }
+
+    [TestMethod]
+    public void AddTheoisticPDF_PassesOptionsThrough()
+    {
+        var services = new ServiceCollection();
+
+        services.AddTheoisticPDF(o =>
+        {
+            o.ExecutablePath = @"C:\configured\chrome.exe";
+            o.RenderTimeout = TimeSpan.FromSeconds(5);
+        });
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+
+        var options = provider.GetRequiredService<PdfRendererOptions>();
+
+        Assert.AreEqual(@"C:\configured\chrome.exe", options.ExecutablePath);
+        Assert.AreEqual(TimeSpan.FromSeconds(5), options.RenderTimeout);
+    }
+
+    // ---------------------------------------------------------------- end to end
+
+    [TestMethod]
+    public async Task Render_ProducesAPdfFromARealBrowser()
+    {
+        RequireBrowser();
+
+        await using var renderer = new ChromiumRenderer();
+        using var builder = new PDFBuilder(renderer);
+
+        AssertIsPdf(await builder.BuildAsync(Html));
+    }
+
+    [TestMethod]
+    public async Task Check_ReportsTheBrowserItFound()
+    {
+        RequireBrowser();
+
+        await using var renderer = new ChromiumRenderer();
+
+        PdfRendererStatus status = await renderer.CheckAsync();
+
+        Assert.IsTrue(status.IsAvailable, status.Description);
+        Assert.IsTrue(
+            status.Description.Contains("Chrome", StringComparison.OrdinalIgnoreCase)
+                || status.Description.Contains("Edg", StringComparison.OrdinalIgnoreCase),
+            $"unexpected product string: {status.Description}");
+    }
+
+    [TestMethod]
+    public async Task Render_HandlesNonAsciiContent()
+    {
+        RequireBrowser();
+
+        await using var renderer = new ChromiumRenderer();
+        using var builder = new PDFBuilder(renderer);
+
+        byte[] pdf = await builder.BuildAsync(
+            """
+            <!DOCTYPE html><html><head><meta charset="utf-8"></head>
+            <body><p>caf&#233; &#8364;1.234,56 &#8212; &#20013;&#25991; &#1605;&#1585;&#1581;&#1576;&#1575;</p></body></html>
+            """);
+
+        AssertIsPdf(pdf);
+    }
+
+    [TestMethod]
+    public async Task Render_ReusesOneBrowserAcrossConcurrentCallers()
+    {
+        RequireBrowser();
+
+        await using var renderer = new ChromiumRenderer();
+
+        // Each render gets its own tab on a shared browser, so these must not interfere.
+        byte[][] results = await Task.WhenAll(Enumerable.Range(0, 4).Select(async i =>
+        {
+            using var builder = new PDFBuilder(renderer);
+
+            return await builder.BuildAsync($"<html><body><h1>document {i}</h1></body></html>");
+        }));
+
+        foreach (byte[] pdf in results)
+        {
+            AssertIsPdf(pdf);
+        }
+    }
+
+    [TestMethod]
+    public async Task Render_AppliesLandscapeToThePageBox()
+    {
+        RequireBrowser();
+
+        await using var renderer = new ChromiumRenderer();
+
+        async Task<byte[]> BuildAsync(Orientation orientation)
+        {
+            using var builder = new PDFBuilder(renderer);
+
+            return await builder
+                .Settings(s => s.Orientation = orientation)
+                .BuildAsync("<html><body><p>orientation</p></body></html>");
+        }
+
+        byte[] portrait = await BuildAsync(Orientation.Portrait);
+        byte[] landscape = await BuildAsync(Orientation.Landscape);
+
+        AssertIsPdf(portrait);
+        AssertIsPdf(landscape);
+
+        // Chromium writes the page box into the page dictionary uncompressed, so the swap is
+        // observable without parsing the whole file.
+        Assert.AreNotEqual(
+            MediaBoxOf(portrait),
+            MediaBoxOf(landscape),
+            "landscape produced the same page box as portrait");
+    }
+
+    [TestMethod]
+    public async Task Render_DocumentTitleReachesThePdfMetadata()
+    {
+        RequireBrowser();
+
+        await using var renderer = new ChromiumRenderer();
+        using var builder = new PDFBuilder(renderer);
+
+        byte[] pdf = await builder
+            .Settings(s => s.DocumentTitle = "Quarterly report")
+            .BuildAsync("<html><head><title>overridden</title></head><body><p>x</p></body></html>");
+
+        // Chromium writes the information dictionary uncompressed, so the title is readable
+        // without parsing the whole file.
+        Assert.IsTrue(
+            Encoding.Latin1.GetString(pdf).Contains("Quarterly report", StringComparison.Ordinal),
+            "DocumentTitle did not reach the PDF metadata");
+    }
+
+    [TestMethod]
+    public async Task Render_WithoutATitleFallsBackToTheDocumentFileName()
+    {
+        RequireBrowser();
+
+        // Chromium records document.title or, failing that, the document's file name. Markup is
+        // rendered from a temporary file, so that name is the one this library chooses - and it
+        // has to stay something innocuous rather than a generated string, because it ends up in
+        // the metadata of every document whose markup carries no title.
+        await using var renderer = new ChromiumRenderer();
+        using var builder = new PDFBuilder(renderer);
+
+        byte[] pdf = await builder.BuildAsync("<html><body><p>no title element</p></body></html>");
+
+        string text = Encoding.Latin1.GetString(pdf);
+
+        Assert.IsTrue(text.Contains("/Title (document.html)", StringComparison.Ordinal), "unexpected fallback title");
+        Assert.IsFalse(text.Contains("theoistic-pdf-", StringComparison.Ordinal), "a generated temp name leaked into the metadata");
+    }
+
+    [TestMethod]
+    public async Task Render_AppliesAnInjectedStylesheet()
+    {
+        RequireBrowser();
+
+        // The whole point of InjectCSS, and it was silently a no-op while the link said
+        // media="screen" and the browser rendered print media. A system font is used rather
+        // than an @font-face so the test needs no font fixture: if the stylesheet is applied,
+        // the typeface appears in the output.
+        string css = Path.Combine(Path.GetTempPath(), $"style-{Guid.NewGuid():N}.css");
+
+        await File.WriteAllTextAsync(css, "body { font-family: 'Courier New', monospace; }");
+
+        await using var renderer = new ChromiumRenderer();
+        using var builder = new PDFBuilder(renderer);
+
+        try
+        {
+            byte[] pdf = await builder
+                .InjectCSS(css)
+                .BuildAsync("<html><body><p>styled by an injected stylesheet</p></body></html>");
+
+            AssertIsPdf(pdf);
+
+            Assert.IsTrue(
+                Encoding.Latin1.GetString(pdf).Contains("Courier", StringComparison.OrdinalIgnoreCase),
+                "the injected stylesheet was not applied: no Courier font is referenced");
+        }
+        finally
+        {
+            File.Delete(css);
+        }
+    }
+
+    [TestMethod]
+    public async Task Render_FromAUrlLoadsThatPage()
+    {
+        RequireBrowser();
+
+        string path = Path.Combine(Path.GetTempPath(), $"page-{Guid.NewGuid():N}.html");
+
+        await File.WriteAllTextAsync(path, "<html><body><h1>from a file url</h1></body></html>");
+
+        await using var renderer = new ChromiumRenderer();
+
+        try
+        {
+            byte[] pdf = await renderer.RenderAsync(
+                new GlobalSettings { PaperSize = PaperKind.A4 },
+                new ObjectSettings { Page = new Uri(path).AbsoluteUri });
+
+            AssertIsPdf(pdf);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [TestMethod]
+    public async Task Render_WithNoBrowserAnywhereExplainsEveryOption()
+    {
+        var options = new PdfRendererOptions
+        {
+            ExecutablePath = Path.Combine(Path.GetTempPath(), $"absent-{Guid.NewGuid():N}.exe"),
+            LaunchTimeout = TimeSpan.FromSeconds(5),
+            RenderTimeout = TimeSpan.FromSeconds(10),
+        };
+
+        await using var renderer = new ChromiumRenderer(options);
+
+        PdfConversionException error = await Assert.ThrowsExceptionAsync<PdfConversionException>(
+            () => renderer.RenderAsync(
+                new GlobalSettings(),
+                new ObjectSettings { HtmlContent = "<p>x</p>" }));
+
+        Assert.IsTrue(
+            error.Message.Contains("Could not start the browser", StringComparison.Ordinal),
+            error.Message);
+    }
+
+    /// <summary>Reads the first page box out of a PDF, for comparing page geometry.</summary>
+    private static string MediaBoxOf(byte[] pdf)
+    {
+        string text = Encoding.Latin1.GetString(pdf);
+        int at = text.IndexOf("/MediaBox", StringComparison.Ordinal);
+
+        Assert.IsTrue(at >= 0, "the document has no /MediaBox");
+
+        int close = text.IndexOf(']', at);
+
+        return text[at..(close + 1)];
     }
 }

@@ -1,8 +1,6 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
-using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Runtime.Loader;
+using Theoistic.PDF.Rendering;
 
 namespace Theoistic.PDF;
 
@@ -10,21 +8,37 @@ public static class TheoisticPDFExtensions
 {
     internal static IServiceProvider? ServiceProvider { get; set; }
 
-    private static int resolverRegistered;
-    private static IntPtr cachedLibrary;
+    /// <summary>
+    /// Registers the HTML renderer. The browser is discovered on first use; nothing is
+    /// downloaded and no engine is shipped with this package.
+    /// </summary>
+    public static IServiceCollection AddTheoisticPDF(this IServiceCollection services) =>
+        services.AddTheoisticPDF(static _ => { });
 
-    public static IServiceCollection AddTheoisticPDF(this IServiceCollection services)
+    /// <summary>
+    /// Registers the HTML renderer with explicit options - a specific browser binary, or a
+    /// remote DevTools address for deployments with no browser of their own.
+    /// </summary>
+    public static IServiceCollection AddTheoisticPDF(
+        this IServiceCollection services,
+        Action<PdfRendererOptions> configure)
     {
         ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configure);
 
-        // Registering the handler more than once would leave duplicates on the event for the
-        // life of the process, so only the first call wins.
-        if (Interlocked.Exchange(ref resolverRegistered, 1) == 0)
+        services.AddSingleton(_ =>
         {
-            AssemblyLoadContext.Default.ResolvingUnmanagedDll += Default_ResolvingUnmanagedDll;
-        }
+            var options = new PdfRendererOptions();
 
-        services.AddSingleton<ThreadSafeHTMLToPDFConverter>();
+            configure(options);
+
+            return options;
+        });
+
+        // A singleton because the renderer keeps one browser alive and hands each render its
+        // own tab; starting a browser per request would cost more than the render.
+        services.AddSingleton<IPdfRenderer>(provider =>
+            new ChromiumRenderer(provider.GetRequiredService<PdfRendererOptions>()));
 
         return services;
     }
@@ -49,103 +63,5 @@ public static class TheoisticPDFExtensions
         ServiceProvider = serviceProvider;
 
         return serviceProvider;
-    }
-
-    private static IntPtr Default_ResolvingUnmanagedDll(Assembly assembly, string unmanagedDllName)
-    {
-        if (!unmanagedDllName.Contains("libwkhtmltox", StringComparison.OrdinalIgnoreCase))
-        {
-            return IntPtr.Zero;
-        }
-
-        IntPtr cached = cachedLibrary;
-
-        if (cached != IntPtr.Zero)
-        {
-            return cached;
-        }
-
-        string? runtimeIdentifier =
-            RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "win" :
-            RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "linux" :
-            RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "osx" :
-            null;
-
-        if (runtimeIdentifier == null)
-        {
-            return IntPtr.Zero; // Unsupported platform
-        }
-
-        string architecture = RuntimeInformation.ProcessArchitecture switch
-        {
-            Architecture.X64 => "x64",
-            Architecture.X86 => "x86",
-            Architecture.Arm64 => "arm64",
-            _ => throw new PlatformNotSupportedException(
-                $"No libwkhtmltox build is available for {RuntimeInformation.ProcessArchitecture}.")
-        };
-
-        string fileExtension = runtimeIdentifier switch
-        {
-            "win" => ".dll",
-            "linux" => ".so",
-            _ => ".dylib"
-        };
-
-        string fileName = $"libwkhtmltox{fileExtension}";
-        string relativePath = Path.Combine("runtimes", $"{runtimeIdentifier}-{architecture}", "native", fileName);
-
-        var probed = new List<string>();
-
-        // Assembly.Location is empty for single-file and some hosted deployments, so the app base
-        // directory is probed as well, along with the flat layout used when the native asset is
-        // copied next to the managed one.
-        foreach (var root in EnumerateProbeRoots())
-        {
-            foreach (var candidate in new[] { Path.Combine(root, relativePath), Path.Combine(root, fileName) })
-            {
-                if (probed.Contains(candidate))
-                {
-                    continue;
-                }
-
-                probed.Add(candidate);
-
-                if (File.Exists(candidate))
-                {
-                    IntPtr handle = NativeLibrary.Load(candidate);
-                    cachedLibrary = handle;
-                    return handle;
-                }
-            }
-        }
-
-        throw new FileNotFoundException(
-            $"Could not find {fileName}. Probed: {string.Join(", ", probed)}");
-    }
-
-    private static IEnumerable<string> EnumerateProbeRoots()
-    {
-        string? assemblyDirectory = null;
-
-        string location = typeof(TheoisticPDFExtensions).Assembly.Location;
-
-        if (!string.IsNullOrEmpty(location))
-        {
-            assemblyDirectory = Path.GetDirectoryName(location);
-        }
-
-        if (!string.IsNullOrEmpty(assemblyDirectory))
-        {
-            yield return assemblyDirectory;
-        }
-
-        string baseDirectory = AppContext.BaseDirectory;
-
-        if (!string.IsNullOrEmpty(baseDirectory) &&
-            !string.Equals(baseDirectory.TrimEnd(Path.DirectorySeparatorChar), assemblyDirectory?.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
-        {
-            yield return baseDirectory;
-        }
     }
 }

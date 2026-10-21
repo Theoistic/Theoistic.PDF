@@ -1,7 +1,7 @@
 <Project Sdk="MSTest.Sdk/3.6.1">
 
   <PropertyGroup>
-    <!-- Mirrors the library's targets so the native interop is exercised on both runtimes. -->
+    <!-- Mirrors the library's targets. -->
     <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -23,21 +23,6 @@
 
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.1" />
-  </ItemGroup>
-
-  <!--
-    A ProjectReference does not carry the native assets that the NuGet package would place under
-    runtimes/<rid>/native, so they are staged here for the end to end conversion tests.
-  -->
-  <ItemGroup>
-    <None Include="..\Theoistic.PDF\Resources\64 Bit\libwkhtmltox.dll"
-          Condition="'$(OS)' == 'Windows_NT'"
-          Link="runtimes\win-x64\native\libwkhtmltox.dll"
-          CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Theoistic.PDF\Resources\64 Bit\libwkhtmltox.so"
-          Condition="'$(OS)' != 'Windows_NT'"
-          Link="runtimes\linux-x64\native\libwkhtmltox.so"
-          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

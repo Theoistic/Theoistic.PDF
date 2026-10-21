@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!--
+        No stylesheet link here on purpose. PDFBuilder.InjectCSS puts one in just above the
+        closing head tag, rewritten to an absolute file url, which is what lets PDFStyle.css
+        reach the font next to it with a relative url.
+    -->
+</head>
+<body>
+    <div class="content">
+        <div class="header">
+            <h1>Invoice {{Number}}</h1>
+            <p>{{Date}} &middot; {{Customer}}</p>
+        </div>
+
+        {{#Items}}
+        <div class="item">
+            <span>{{Name}}</span>
+            <span>{{Value}}</span>
+        </div>
+        {{/Items}}
+
+        {{^HasItems}}
+        <div class="item"><span>Nothing to invoice.</span></div>
+        {{/HasItems}}
+
+        <div class="item">
+            <span><strong>Total</strong></span>
+            <span><strong>{{Total}}</strong></span>
+        </div>
+    </div>
+</body>
+</html>

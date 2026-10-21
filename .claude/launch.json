@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "PDFWebTest",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["run", "--project", "PDFWebTest/PDFWebTest.csproj", "--launch-profile", "http"],
+      "port": 5258
+    }
+  ]
+}

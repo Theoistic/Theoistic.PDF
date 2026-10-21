@@ -4,7 +4,38 @@
     ViewData["Title"] = "Home page";
 }
 
-<div class="text-center">
-    <h1 class="display-4">Welcome</h1>
-    <p>Learn about <a href="https://docs.microsoft.com/aspnet/core">building Web apps with ASP.NET Core</a>.</p>
-</div>
+<h1 class="display-4">Theoistic.PDF</h1>
+
+<p>
+    HTML to PDF with no bundled engine: the library drives a Chromium-family browser already
+    installed on this machine over the DevTools Protocol.
+</p>
+
+@if (Model.Status.IsAvailable)
+{
+    <p class="text-success">Renderer: @Model.Status.Description</p>
+
+    <p>
+        <a class="btn btn-primary" asp-page="Index" asp-page-handler="Pdf" target="_blank">
+            Generate invoice PDF
+        </a>
+    </p>
+
+    <p class="text-muted">
+        The invoice is a Mustache template rendered by <code>MustacheRenderer</code>, styled by
+        <code>InjectCSS</code> (including a custom <code>@@font-face</code>), then converted with
+        a header and footer using the <code>[page]</code> and <code>[topage]</code> placeholders.
+    </p>
+}
+else
+{
+    <div class="alert alert-warning">
+        <p><strong>No browser available, so nothing can be rendered.</strong></p>
+        <p>@Model.Status.Description</p>
+        <p class="mb-0">
+            Install Microsoft Edge, Google Chrome or Chromium, or configure
+            <code>ExecutablePath</code> or <code>RemoteAddress</code> in
+            <code>AddTheoisticPDF</code>.
+        </p>
+    </div>
+}

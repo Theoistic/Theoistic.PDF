@@ -9,7 +9,7 @@
 		<PackageId>Theoistic.PDF</PackageId>
 		<Title>Theoistic.PDF</Title>
 		<Authors>Theodor Solbjorg</Authors>
-		<Description>A library to generate PDF's from html.</Description>
+		<Description>PDF generation for .NET with no bundled engine and no native binaries. Compose documents directly in managed code, or render HTML and CSS by driving a Chrome, Edge or Chromium browser already installed on the machine.</Description>
 		<PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 		<PackageTags>aspnetcore pdf</PackageTags>
@@ -19,22 +19,25 @@
 		<RepositoryType>git</RepositoryType>
 	</PropertyGroup>
 
-	<ItemGroup>
-		<!-- Windows -->
-		<None Include="Resources\32 Bit\libwkhtmltox.dll" Pack="true" PackagePath="runtimes\win-x86\native" />
-		<None Include="Resources\64 Bit\libwkhtmltox.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
-
-		<!-- Linux -->
-		<None Include="Resources\32 Bit\libwkhtmltox.so" Pack="true" PackagePath="runtimes\linux-x86\native" />
-		<None Include="Resources\64 Bit\libwkhtmltox.so" Pack="true" PackagePath="runtimes\linux-x64\native" />
-
-		<!-- macOS -->
-		<None Include="Resources\32 Bit\libwkhtmltox.dylib" Pack="true" PackagePath="runtimes\osx-x86\native" />
-		<None Include="Resources\64 Bit\libwkhtmltox.dylib" Pack="true" PackagePath="runtimes\osx-x64\native" />
-	</ItemGroup>
+	<!--
+		No native assets. HTML rendering drives a Chromium-family browser already present on the
+		machine over the DevTools Protocol, and documents can also be composed directly with
+		Theoistic.PDF.Writing, which is pure managed code. Nothing is shipped or downloaded.
+	-->
 
 	<ItemGroup>
 		<None Include="..\README.md" Pack="true" PackagePath="" />
+	</ItemGroup>
+
+	<!--
+		The PDF writer's byte-level pieces are internal on purpose: the serialiser and the
+		content-stream buffer are not a public contract. The tests still need to reach them to
+		assert on the emitted syntax rather than only on whole files.
+	-->
+	<ItemGroup>
+		<AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+			<_Parameter1>Theoistic.PDF.Tests</_Parameter1>
+		</AssemblyAttribute>
 	</ItemGroup>
 
 	<ItemGroup>

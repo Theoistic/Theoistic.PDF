@@ -1,10 +1,11 @@
 using Microsoft.Extensions.DependencyInjection;
+using Theoistic.PDF.Rendering;
 
 namespace Theoistic.PDF;
 
 public class PDFBuilder : IDisposable
 {
-    private readonly ThreadSafeHTMLToPDFConverter converter;
+    private readonly IPdfRenderer renderer;
 
     private string? IncludeCSS;
     private bool disposed;
@@ -45,7 +46,18 @@ public class PDFBuilder : IDisposable
             ?? throw new InvalidOperationException(
                 "Theoistic.PDF has not been initialised. Call services.AddTheoisticPDF() and app.UseTheoisticPDF() during startup before creating a PDFBuilder.");
 
-        converter = services.GetRequiredService<ThreadSafeHTMLToPDFConverter>();
+        renderer = services.GetRequiredService<IPdfRenderer>();
+    }
+
+    /// <summary>
+    /// Uses a renderer directly, for callers that resolve it themselves or want to substitute
+    /// one in a test.
+    /// </summary>
+    public PDFBuilder(IPdfRenderer renderer)
+    {
+        ArgumentNullException.ThrowIfNull(renderer);
+
+        this.renderer = renderer;
     }
 
     /// <summary>
@@ -74,7 +86,11 @@ public class PDFBuilder : IDisposable
         // which a manual %20 replacement does not.
         var href = new Uri(Path.GetFullPath(file)).AbsoluteUri;
 
-        IncludeCSS = $"<link href=\"{href}\" rel=\"stylesheet\" type=\"text/css\" media=\"screen\">";
+        // media="all", not "screen". A screen-only stylesheet is ignored while the browser is
+        // rendering print media, which is what printing a document does - so the injected CSS
+        // would silently do nothing. Injecting a stylesheet is an instruction to style the PDF,
+        // so it has to apply whichever media the page is rendered for.
+        IncludeCSS = $"<link href=\"{href}\" rel=\"stylesheet\" type=\"text/css\" media=\"all\">";
 
         return this;
     }
@@ -87,10 +103,9 @@ public class PDFBuilder : IDisposable
         => BuildAsync(html, settings, CancellationToken.None);
 
     /// <summary>
-    /// Renders <paramref name="html"/> to PDF. The token only cancels the request while it is
-    /// still queued; a conversion that has reached wkhtmltox cannot be interrupted.
+    /// Renders <paramref name="html"/> to PDF.
     /// </summary>
-    public Task<byte[]> BuildAsync(string html, Action<ObjectSettings>? settings, CancellationToken cancellationToken)
+    public async Task<byte[]> BuildAsync(string html, Action<ObjectSettings>? settings, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
         ArgumentNullException.ThrowIfNull(html);
@@ -100,13 +115,17 @@ public class PDFBuilder : IDisposable
         ObjectSettings objSetting = ObjectSettings;
         objSetting.HtmlContent = InjectStyles(html);
 
-        var doc = new HtmlToPdfDocument
-        {
-            GlobalSettings = GlobalSettings,
-            Objects = { objSetting }
-        };
+        byte[] pdf = await renderer.RenderAsync(GlobalSettings, objSetting, cancellationToken)
+            .ConfigureAwait(false);
 
-        return converter.ConvertAsync(doc, cancellationToken);
+        if (GlobalSettings.Out is { Length: > 0 } path)
+        {
+            // wkhtmltox used to write this file itself. The renderer deals only in bytes, so
+            // the setting is honoured here instead.
+            await File.WriteAllBytesAsync(path, pdf, cancellationToken).ConfigureAwait(false);
+        }
+
+        return pdf;
     }
 
     private string InjectStyles(string html)
@@ -131,7 +150,7 @@ public class PDFBuilder : IDisposable
 
     public void Dispose()
     {
-        // The converter is a singleton owned by the container, so there is nothing per-builder
+        // The renderer is a singleton owned by the container, so there is nothing per-builder
         // to release. Kept so existing `using` blocks continue to compile.
         disposed = true;
 
