@@ -19,7 +19,15 @@ public sealed class PdfDocument
     private readonly List<PdfObject?> objects = new List<PdfObject?> { null };
 
     private readonly List<PdfPage> pages = new List<PdfPage>();
-    private readonly Dictionary<StandardFont, PdfReference> fontObjects = new Dictionary<StandardFont, PdfReference>();
+
+    // A list alongside the lookup because finalisation order decides object numbering, and
+    // output has to be byte-for-byte reproducible.
+    private readonly Dictionary<PdfFont, FontResource> fontResources = new Dictionary<PdfFont, FontResource>();
+    private readonly List<FontResource> fontOrder = new List<FontResource>();
+
+    // One XObject per image however many times it is drawn, so a logo repeated on every page is
+    // stored once.
+    private readonly Dictionary<PdfImage, PdfReference> imageObjects = new Dictionary<PdfImage, PdfReference>();
 
     private readonly PdfDictionary catalog;
     private readonly PdfDictionary pageTree;
@@ -110,27 +118,36 @@ public sealed class PdfDocument
     }
 
     /// <summary>
-    /// Returns the shared font object for one of the standard typefaces, creating it on first
-    /// use. One dictionary per typeface is enough however many pages reference it.
+    /// Returns this document's state for <paramref name="font"/>, creating it on first use. One
+    /// font object per typeface is shared by every page that uses it.
     /// </summary>
-    internal PdfReference GetFontObject(StandardFont font)
+    internal FontResource GetFontResource(PdfFont font)
     {
-        if (fontObjects.TryGetValue(font, out PdfReference? existing))
+        ArgumentNullException.ThrowIfNull(font);
+
+        if (fontResources.TryGetValue(font, out FontResource? existing))
         {
             return existing;
         }
 
-        // The standard typefaces need no descriptor and no embedded data: a conforming reader
-        // is required to have metrics for all fourteen. WinAnsiEncoding is specified so that
-        // byte values above 127 map to the Latin-1 letters rather than the reader's default.
-        var dictionary = new PdfDictionary()
-            .Set("Type", PdfName.Font)
-            .Set("Subtype", PdfName.Type1)
-            .SetName("BaseFont", font.BaseFontName)
-            .Set("Encoding", PdfName.WinAnsiEncoding);
+        FontResource resource = font.CreateResource(this);
 
-        PdfReference reference = Add(dictionary);
-        fontObjects[font] = reference;
+        fontResources[font] = resource;
+        fontOrder.Add(resource);
+
+        return resource;
+    }
+
+    /// <summary>Returns the shared XObject for <paramref name="image"/>, writing it on first use.</summary>
+    internal PdfReference GetImageObject(PdfImage image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+
+        if (!imageObjects.TryGetValue(image, out PdfReference? reference))
+        {
+            reference = image.AddTo(this);
+            imageObjects[image] = reference;
+        }
 
         return reference;
     }
@@ -218,6 +235,13 @@ public sealed class PdfDocument
 
         pageTree.Set("Kids", kids);
         pageTree.Set("Count", pages.Count);
+
+        // After the pages, because an embedded font's subset is whatever the content streams
+        // drew with it, and that is only known once all of them are complete.
+        foreach (FontResource font in fontOrder)
+        {
+            font.Finalise(this);
+        }
 
         // The information dictionary is only emitted when something was set, which keeps the
         // default output free of anything that varies between runs. Registered at most once,

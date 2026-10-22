@@ -17,6 +17,12 @@
     <ProjectReference Include="..\Theoistic.PDF\Theoistic.PDF.csproj" />
   </ItemGroup>
 
+  <!-- Synthetic fonts and images made by Fixtures/generate.py; nothing third-party. -->
+  <ItemGroup>
+    <None Include="Fixtures\Fonts\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Fixtures\Images\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.0" />
   </ItemGroup>

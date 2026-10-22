@@ -4,15 +4,14 @@
 		<TargetFrameworks>net9.0;net10.0</TargetFrameworks>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
-		<PackageVersion>1.1.0</PackageVersion>
+		<PackageVersion>2.0.0</PackageVersion>
 		<PackageId>Theoistic.PDF</PackageId>
 		<Title>Theoistic.PDF</Title>
 		<Authors>Theodor Solbjorg</Authors>
-		<Description>PDF generation for .NET with no bundled engine and no native binaries. Compose documents directly in managed code, or render HTML and CSS by driving a Chrome, Edge or Chromium browser already installed on the machine.</Description>
+		<Description>PDF generation for .NET with no bundled engine, no native binaries and no copyleft. Fill in an invoice and pick a template, lay out flowing documents with tables and pagination, or draw directly, all in pure managed code with embedded TrueType fonts and JPEG/PNG images. Or render HTML and CSS by driving a Chrome, Edge or Chromium browser already installed on the machine.</Description>
 		<PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
-		<PackageTags>aspnetcore pdf</PackageTags>
+		<PackageTags>pdf invoice html-to-pdf pdf-generation truetype aspnetcore</PackageTags>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageProjectUrl>https://github.com/Theoistic/Theoistic.PDF</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/Theoistic/Theoistic.PDF</RepositoryUrl>

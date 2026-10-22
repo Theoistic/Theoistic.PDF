@@ -11,7 +11,7 @@ namespace Theoistic.PDF.Writing;
 /// parser anyway.
 /// </para>
 /// </summary>
-public sealed class StandardFont
+public sealed class StandardFont : PdfFont
 {
     // Widths are in glyph space: thousandths of the font size, which is how PDF font metrics
     // are always expressed.
@@ -19,23 +19,54 @@ public sealed class StandardFont
     private const int WidthsEnd = 126;
 
     private readonly int[] widths;
+    private readonly bool bold;
+    private readonly bool italic;
 
-    private StandardFont(string baseFontName, int[] widths, bool bold, bool italic)
+    private StandardFont(string baseFontName, int[] widths, bool bold, bool italic, double ascent, double descent)
     {
         BaseFontName = baseFontName;
         this.widths = widths;
-        IsBold = bold;
-        IsItalic = italic;
+        this.bold = bold;
+        this.italic = italic;
+        Ascent = ascent;
+        Descent = descent;
     }
 
     /// <summary>The name written into the font dictionary, such as Helvetica-BoldOblique.</summary>
     public string BaseFontName { get; }
 
-    public bool IsBold { get; }
+    public override string Name => BaseFontName;
 
-    public bool IsItalic { get; }
+    public override bool IsBold => bold;
 
-    public override string ToString() => BaseFontName;
+    public override bool IsItalic => italic;
+
+    /// <inheritdoc />
+    /// <remarks>The Ascender value from the typeface's Adobe Font Metrics.</remarks>
+    public override double Ascent { get; }
+
+    /// <inheritdoc />
+    /// <remarks>The Descender value from the typeface's Adobe Font Metrics.</remarks>
+    public override double Descent { get; }
+
+    /// <inheritdoc />
+    public override string? FindUnsupported(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+
+        foreach (char c in text)
+        {
+            if (!CanEncode(c))
+            {
+                return c.ToString();
+            }
+        }
+
+        return null;
+    }
+
+    internal override FontResource CreateResource(PdfDocument document) =>
+        new StandardFontResource(this, document);
 
     // ---------------------------------------------------------------- metrics
 
@@ -68,7 +99,7 @@ public sealed class StandardFont
     /// Width of a string at a given font size, in points. Does not account for character or
     /// word spacing, which are graphics state and belong to whoever set them.
     /// </summary>
-    public double GetTextWidth(string text, double size)
+    public override double GetTextWidth(string text, double size)
     {
         ArgumentNullException.ThrowIfNull(text);
 
@@ -122,7 +153,7 @@ public sealed class StandardFont
         '‘' or '’' => '\'',
         '“' or '”' => '"',
         '–' or '—' => '-',
-        ' ' => ' ',
+        '\u00A0' => ' ',
         _ => '\0'
     };
 
@@ -154,7 +185,7 @@ public sealed class StandardFont
 
             // WinAnsi agrees with Latin-1 from 0xA0 up, and differs only in the block that
             // Latin-1 leaves as control codes.
-            if (c >= ' ' && c <= 'ÿ')
+            if (c >= '\u00A0' && c <= 'ÿ')
             {
                 bytes[i] = (byte)c;
                 continue;
@@ -174,6 +205,10 @@ public sealed class StandardFont
 
         return new PdfString(bytes);
     }
+
+    /// <summary>Whether <see cref="Encode"/> can represent the character.</summary>
+    internal static bool CanEncode(char c) =>
+        c <= '\u007F' || (c >= ' ' && c <= 'ÿ') || MapHighRange(c) != 0;
 
     /// <summary>
     /// The characters WinAnsi places in 0x80-0x9F, where Latin-1 has control codes. Returns
@@ -308,40 +343,40 @@ public sealed class StandardFont
     }
 
     public static StandardFont Helvetica { get; } =
-        new StandardFont("Helvetica", HelveticaWidths, bold: false, italic: false);
+        new StandardFont("Helvetica", HelveticaWidths, bold: false, italic: false, ascent: 718, descent: -207);
 
     public static StandardFont HelveticaBold { get; } =
-        new StandardFont("Helvetica-Bold", HelveticaBoldWidths, bold: true, italic: false);
+        new StandardFont("Helvetica-Bold", HelveticaBoldWidths, bold: true, italic: false, ascent: 718, descent: -207);
 
     public static StandardFont HelveticaOblique { get; } =
-        new StandardFont("Helvetica-Oblique", HelveticaWidths, bold: false, italic: true);
+        new StandardFont("Helvetica-Oblique", HelveticaWidths, bold: false, italic: true, ascent: 718, descent: -207);
 
     public static StandardFont HelveticaBoldOblique { get; } =
-        new StandardFont("Helvetica-BoldOblique", HelveticaBoldWidths, bold: true, italic: true);
+        new StandardFont("Helvetica-BoldOblique", HelveticaBoldWidths, bold: true, italic: true, ascent: 718, descent: -207);
 
     public static StandardFont TimesRoman { get; } =
-        new StandardFont("Times-Roman", TimesRomanWidths, bold: false, italic: false);
+        new StandardFont("Times-Roman", TimesRomanWidths, bold: false, italic: false, ascent: 683, descent: -217);
 
     public static StandardFont TimesBold { get; } =
-        new StandardFont("Times-Bold", TimesBoldWidths, bold: true, italic: false);
+        new StandardFont("Times-Bold", TimesBoldWidths, bold: true, italic: false, ascent: 683, descent: -217);
 
     public static StandardFont TimesItalic { get; } =
-        new StandardFont("Times-Italic", TimesItalicWidths, bold: false, italic: true);
+        new StandardFont("Times-Italic", TimesItalicWidths, bold: false, italic: true, ascent: 683, descent: -217);
 
     public static StandardFont TimesBoldItalic { get; } =
-        new StandardFont("Times-BoldItalic", TimesBoldItalicWidths, bold: true, italic: true);
+        new StandardFont("Times-BoldItalic", TimesBoldItalicWidths, bold: true, italic: true, ascent: 683, descent: -217);
 
     public static StandardFont Courier { get; } =
-        new StandardFont("Courier", CourierWidths, bold: false, italic: false);
+        new StandardFont("Courier", CourierWidths, bold: false, italic: false, ascent: 629, descent: -157);
 
     public static StandardFont CourierBold { get; } =
-        new StandardFont("Courier-Bold", CourierWidths, bold: true, italic: false);
+        new StandardFont("Courier-Bold", CourierWidths, bold: true, italic: false, ascent: 629, descent: -157);
 
     public static StandardFont CourierOblique { get; } =
-        new StandardFont("Courier-Oblique", CourierWidths, bold: false, italic: true);
+        new StandardFont("Courier-Oblique", CourierWidths, bold: false, italic: true, ascent: 629, descent: -157);
 
     public static StandardFont CourierBoldOblique { get; } =
-        new StandardFont("Courier-BoldOblique", CourierWidths, bold: true, italic: true);
+        new StandardFont("Courier-BoldOblique", CourierWidths, bold: true, italic: true, ascent: 629, descent: -157);
 
     /// <summary>
     /// Picks a variant of one of the three families by weight and slope, which is what a style
@@ -388,4 +423,29 @@ public enum StandardFontFamily
     Helvetica,
     Times,
     Courier
+}
+
+/// <summary>
+/// A standard font within one document. The dictionary is complete as soon as it is created:
+/// nothing is embedded, so there is nothing to gather before saving.
+/// </summary>
+internal sealed class StandardFontResource : FontResource
+{
+    public StandardFontResource(StandardFont font, PdfDocument document)
+        : base(document.Add(CreateDictionary(font)))
+    {
+    }
+
+    public override PdfString Encode(string text) => StandardFont.Encode(text);
+
+    private static PdfDictionary CreateDictionary(StandardFont font) =>
+
+        // Every conforming reader has metrics for these, so no descriptor or widths are needed.
+        // WinAnsiEncoding is stated so that bytes above 127 map to the Latin-1 letters rather
+        // than to the reader's default encoding.
+        new PdfDictionary()
+            .Set("Type", PdfName.Font)
+            .Set("Subtype", PdfName.Type1)
+            .SetName("BaseFont", font.BaseFontName)
+            .Set("Encoding", PdfName.WinAnsiEncoding);
 }

@@ -6,17 +6,23 @@ The package is pure managed code. It ships nothing to install, downloads nothing
 carries no LGPL or AGPL obligations — which is unusual in this corner of the .NET ecosystem,
 where most options are either a 40 MB native library or a dual licence with a revenue threshold.
 
-It gives you two ways to make a PDF, and you can use either or both:
+> **2.0 is a fresh start and is not backwards compatible with 1.x.** wkhtmltopdf and its native
+> binaries are gone, `PDFBuilder` is now `HtmlPdfBuilder` with no alias, and HTML rendering needs
+> a browser on the machine. See [Upgrading from 1.x](#upgrading-from-1x) before you update.
 
-| | What it does | Needs a browser? |
+There are four levels to work at. The first three need nothing but .NET:
+
+| | You work in | Needs a browser? |
 |---|---|---|
-| **`Theoistic.PDF.Writing`** | Compose a document directly — pages, text, paths, colour, measured text | **No.** Works anywhere .NET runs |
-| **`PDFBuilder`** | Render HTML + CSS to PDF | **Yes.** Drives an installed Chrome/Edge/Chromium |
+| **`Theoistic.PDF.Templates`** | A model you fill in — `InvoiceTemplate.Modern.ToPdf(invoice)` | **No** |
+| **`Theoistic.PDF.Layout`** | Blocks that flow: headings, paragraphs, tables, images. Wraps and paginates for you | **No** |
+| **`Theoistic.PDF.Writing`** | Points on a page: text, paths, colour, images | **No** |
+| **`HtmlPdfBuilder`** | HTML and CSS, rendered by Chrome, Edge or Chromium | **Yes** |
 
-The HTML path has full modern fidelity — flexbox, grid, web fonts, CJK, Arabic shaping, emoji —
-because it drives a real, current browser rather than a frozen engine. The cost is that a browser
-has to be present. **If you are deploying to Docker, Azure or DigitalOcean, read
-[Deployment](#deployment) before you ship.**
+The non-browser levels embed TrueType fonts as subsets, so names like *Łukasz Żółć* or
+*Şişli* print correctly, and embed JPEG and PNG images with their transparency. The HTML level
+has full browser fidelity, at the cost of needing a browser installed — **if you are deploying
+HTML rendering to Docker, Azure or DigitalOcean, read [Deployment](#deployment) first.**
 
 - Targets `net9.0` and `net10.0`
 - Dependencies: `Microsoft.AspNetCore.Http.Abstractions`, `Microsoft.Extensions.DependencyInjection.Abstractions` — both MIT
@@ -28,10 +34,336 @@ has to be present. **If you are deploying to Docker, Azure or DigitalOcean, read
 dotnet add package Theoistic.PDF
 ```
 
-## Quick start — HTML to PDF
+## What's new in 2.0
+
+| Feature | In one line | More |
+|---|---|---|
+| Invoice templates | `InvoiceTemplate.Modern.ToPdf(invoice, new InvoiceOptions { Logo = logo })` | [Invoices](#invoices) |
+| Quotes, receipts, credit notes | `new InvoiceOptions { Kind = InvoiceDocumentKind.Receipt }` | [Invoices](#invoices) |
+| Correct invoice arithmetic | `InvoiceTotals.Calculate(invoice)` — decimal, per-rate tax, currency precision | [The arithmetic](#the-arithmetic-is-done-for-you-and-done-properly) |
+| Your own templates | `class MyTemplate : InvoiceTemplate` | [Your own template](#adding-to-an-invoice-or-making-your-own-template) |
+| Flowing documents | `new FlowDocument().Heading(...).Table(items, ...)` — wraps, paginates, repeats headers | [Documents without coordinates](#documents-without-coordinates) |
+| Embedded TrueType fonts | `PdfFontFamily.FromFiles("NotoSans-Regular.ttf", "NotoSans-Bold.ttf")` — subset, searchable | [Fonts](#fonts) |
+| Text checked before rendering | `doc.FindUnsupportedText()` lists every character a font cannot draw | [Fonts](#fonts) |
+| JPEG and PNG images | `PdfImage.FromFile("logo.png")` — PNG transparency kept | [Images](#images) |
+| Drawing API | `page.Content.DrawText(...)`, `.Rectangle(...)`, `.DrawImage(...)` | [Drawing directly](#drawing-directly) |
+| HTML without native binaries | `HtmlPdfBuilder` drives an installed Chrome, Edge or Chromium, or a remote one | [HTML to PDF](#html-to-pdf) |
+| Reproducible output | The same input always produces byte-identical files | [Drawing directly](#drawing-directly) |
+
+## Invoices
+
+Fill in an `Invoice`, pick a template, get a PDF. No coordinates, no HTML, no browser.
+
+```csharp
+using Theoistic.PDF.Templates;
+using Theoistic.PDF.Writing;
+
+var invoice = new Invoice
+{
+    Number = "2026-0042",
+    IssueDate = new DateOnly(2026, 10, 22),
+    DueDate = new DateOnly(2026, 11, 21),
+    Currency = "EUR",
+    TaxRate = 0.25m,
+    Seller = new Party { Name = "Theoistic ApS", Address = "Niels Finsens gøta 1\nFO-100 Tórshavn", TaxId = "FO 123456" },
+    Buyer = new Party { Name = "Acme Industries Ltd", Address = "14 Harbour Road\nBelfast BT3 9DT" },
+    Lines =
+    {
+        new InvoiceLine("PDF writer core", quantity: 1, unitPrice: 1200m),
+        new InvoiceLine("Consulting", quantity: 6.5m, unitPrice: 140m) { Unit = "hrs", Detail = "On-site architecture review" },
+        new InvoiceLine("Printed manual", quantity: 3, unitPrice: 18.50m) { TaxRate = 0m },
+    },
+    Payment = new PaymentDetails { Iban = "FO97 6460 0001 6312 34", Bic = "EIKBFOTF", Reference = "2026-0042" },
+    Notes = "Thank you for your business.",
+};
+
+byte[] pdf = InvoiceTemplate.Modern.ToPdf(invoice, new InvoiceOptions
+{
+    Logo = PdfImage.FromFile("logo.png"),
+});
+```
+
+Three designs are built in — **`Modern`** (accent header, striped table, an accent bar for the
+amount due), **`Classic`** (serif, ruled, ledger-style double rule above the total) and
+**`Minimal`** (hairlines, no fills, the accent kept for the one figure that matters).
+
+The same model prints as four documents:
+
+```csharp
+new InvoiceOptions { Kind = InvoiceDocumentKind.Quote }       // "Valid until", no payment section
+new InvoiceOptions { Kind = InvoiceDocumentKind.Receipt }     // marked paid
+new InvoiceOptions { Kind = InvoiceDocumentKind.CreditNote }  // "Total credit"; Reference names the invoice credited
+```
+
+A part-paid invoice shows what has been paid and what is still due:
+
+```csharp
+invoice.AmountPaid = 500m;   // adds "Paid -500.00 EUR" and "Amount due" rows
+```
+
+### The arithmetic is done for you, and done properly
+
+Totals are never supplied — they are calculated from the lines, so a printed total can never
+disagree with the lines above it. The same figures are available for your own use, such as
+storing them alongside the invoice:
+
+```csharp
+InvoiceTotals totals = InvoiceTotals.Calculate(invoice);
+
+Console.WriteLine($"{totals.Subtotal} + {totals.TaxTotal} tax = {totals.Total}");
+
+foreach (TaxGroup tax in totals.Taxes)
+{
+    Console.WriteLine($"{tax.Rate:P0} on {tax.Base}: {tax.Amount}");
+}
+```
+
+- All money is `decimal`, rounded to the **currency's own precision**: two places for EUR, none
+  for JPY or ISK, three for KWD.
+- Tax is computed **once per rate**, on the sum of the lines at that rate, then rounded once —
+  the way EU VAT is meant to be done, which avoids the cent-out errors of rounding every line.
+- Midpoints round **away from zero**, as people do with money, not to even as .NET does by default.
+- `PricesIncludeTax = true` extracts tax from gross prices instead of adding it.
+- Zero-rated lines form their own 0% group, because VAT invoices have to disclose them.
+- Discount and per-line tax columns appear only when they say something — a discount column when
+  a line is discounted, a tax column when lines are taxed at different rates.
+
+### Options
+
+| Option | Default | |
+|---|---|---|
+| `Logo` | none | JPEG or PNG. Without one, the seller's name is set as the letterhead |
+| `AccentColor` | per template | `PdfColor.FromHex("#0f766e")` |
+| `Fonts` | Helvetica or Times | See [Fonts](#fonts) — needed for text outside Western European |
+| `Culture` | invariant | Number and date formatting: `CultureInfo.GetCultureInfo("da-DK")` |
+| `Labels` | English | Every fixed string: `InvoiceLabels.English with { TaxName = "VAT", BillTo = "Customer" }` |
+| `PaperSize` | A4 | `PdfPaperSize.Letter` and others |
+| `FormatAmount` | culture + currency decimals | Your own amount formatter |
+
+### Text the font cannot show is caught up front
+
+The default fonts are the standard PDF typefaces, which embed nothing but only cover Western
+European text. Before rendering, a template checks every string against its fonts and, if any
+character is missing, throws a `PdfTextCoverageException` listing **every** problem at once —
+not just the first one it trips over:
+
+```
+4 character(s) cannot be shown in the document's fonts:
+  U+0141 'Ł' in "Łukasz Żółć" (not in Helvetica, Helvetica-Bold)
+  U+017B 'Ż' in "Łukasz Żółć" (not in Helvetica, Helvetica-Bold)
+  U+0142 'ł' in "Łukasz Żółć" (not in Helvetica, Helvetica-Bold)
+  U+0107 'ć' in "Łukasz Żółć" (not in Helvetica, Helvetica-Bold)
+Set InvoiceOptions.Fonts to a TrueType family that covers these characters, for example PdfFontFamily.FromFiles("NotoSans-Regular.ttf", "NotoSans-Bold.ttf").
+```
+
+`ó` is not listed: WinAnsi has it. The full detail, one entry per character and font, is on
+the exception's `Problems`.
+
+### Adding to an invoice, or making your own template
+
+`ToDocument` returns the laid-out document before it is rendered, so you can append to any
+template:
+
+```csharp
+FlowDocument doc = InvoiceTemplate.Classic.ToDocument(invoice);
+doc.PageBreak();
+doc.Heading("Terms and conditions");
+doc.Paragraph(termsText);
+doc.Save("invoice.pdf");
+```
+
+To design your own, derive from `InvoiceTemplate` and arrange the sections in `Compose`. The
+base class supplies the parts every invoice shares — `PartyParagraph`, `MetaTable`,
+`LinesTable`, `TotalRows`, `TotalsTable`, `PaymentParagraph`, `NotesBlocks`, `Letterhead` — and
+the `InvoiceContext` it hands you formats money, dates and percentages for the chosen culture.
+Validation, the totals and the font coverage check all come with it.
+
+```csharp
+using Theoistic.PDF.Layout;
+using Theoistic.PDF.Templates;
+using Theoistic.PDF.Writing;
+
+public sealed class LetterheadTemplate : InvoiceTemplate
+{
+    public override string Name => "Letterhead";
+
+    protected override PdfColor DefaultAccent => PdfColor.FromHex("#7c2d12");
+
+    protected override PdfFontFamily DefaultFonts => PdfFontFamily.Helvetica;
+
+    protected override FlowDocument Compose(InvoiceContext c)
+    {
+        TextStyle body = c.Style(10);
+        FlowDocument doc = NewDocument(c, Thickness.Millimetres(20, 18, 20, 18), body, c.Style(8, color: PdfColor.Gray(0.5)));
+
+        doc.Add(Letterhead(c, c.Style(18, bold: true, color: c.Accent)));
+        doc.Add(new Paragraph($"{c.Title} {c.Invoice.Number} — {c.Date(c.Invoice.IssueDate)}", c.Style(14, bold: true))
+        {
+            SpaceBefore = 12,
+            SpaceAfter = 12,
+        });
+        doc.Add(PartyParagraph(c, c.Invoice.Buyer, body with { Bold = true }, body));
+        doc.Add(LinesTable(c, new TableStyle { HeaderBackground = c.Accent, HeaderText = c.Style(9, bold: true, color: PdfColor.White) }, c.Style(8)));
+        doc.Add(TotalsTable(TotalRows(c), body, body, body with { Bold = true }, body with { Bold = true }, new Thickness(2, 6)));
+
+        return doc;
+    }
+}
+
+byte[] pdf = new LetterheadTemplate().ToPdf(invoice);
+```
+
+## Documents without coordinates
+
+`FlowDocument` is the layer the templates are built on, and it is public. Add blocks; rendering
+wraps the text, sizes the tables, breaks pages where it has to, repeats table headers on
+continuation pages, and draws page numbers once the page count is known.
+
+```csharp
+using Theoistic.PDF.Layout;
+
+var doc = new FlowDocument();
+doc.Footer.Center = "Page {page} of {pages}";
+
+doc.Heading("Open orders");
+doc.Paragraph("Everything not yet shipped, as of this morning.");
+
+doc.Table(orders, t => t
+    .Column("Order", o => o.Id, ColumnWidth.Auto)
+    .Column("Customer", o => o.Customer)
+    .Column("Total", o => o.Total.ToString("N2"), ColumnWidth.Auto, TextAlign.Right)
+    .WithStyle(new TableStyle { HeaderBackground = PdfColor.FromHex("#1f3a5f"), AlternateRowBackground = PdfColor.Gray(0.96) }));
+
+byte[] pdf = doc.ToArray();
+```
+
+| Block | |
+|---|---|
+| `Paragraph` | Wrapped text, mixing styles in one paragraph: `new Paragraph().Add("Due: ").Add(date, bold)`. Splits across pages line by line |
+| `TableBlock` | Columns `Fixed`, `Relative` or `Auto` (sized to content — right for numbers). Rows never split; the header repeats and is never stranded at the foot of a page |
+| `ColumnsBlock` | Blocks side by side — a logo beside a title, two addresses |
+| `PanelBlock` | Blocks in a padded box with a fill and border |
+| `KeepTogether` | Blocks that move to the next page as a group rather than split |
+| `ImageBlock` | An image scaled to fit, keeping its proportions |
+| `RuleBlock`, `SpacerBlock`, `PageBreakBlock` | What they say |
+
+Every block takes `SpaceBefore`, `SpaceAfter`, and `MaxWidth` with `HorizontalAlign` — so a
+totals table can be 250pt wide and sit at the right. Leading space is dropped at the top of a
+page, as in a word processor.
+
+Styles are immutable records, so variations read naturally:
+`doc.DefaultStyle with { Size = 14, Bold = true, Color = PdfColor.FromHex("#1f3a5f") }`.
+
+Putting the containers together — a logo beside a title, a paragraph mixing styles, and a boxed
+section that stays with its heading:
+
+```csharp
+var doc = new FlowDocument();
+doc.Header.Right = "Quarterly report";
+doc.Header.RuleColor = PdfColor.Gray(0.8);
+doc.Header.OnFirstPage = false;
+doc.Footer.Center = "Page {page} of {pages}";
+
+TextStyle muted = doc.DefaultStyle with { Size = 8.5, Color = PdfColor.Gray(0.45) };
+
+doc.Add(new ColumnsBlock()
+    .Add(ColumnWidth.Relative(), new ImageBlock(PdfImage.FromFile("logo.png"), maxHeight: 40))
+    .Add(ColumnWidth.Relative(), new Paragraph("Q3 2026", doc.DefaultStyle with { Size = 20, Bold = true }) { Align = TextAlign.Right }));
+
+doc.Add(new Paragraph()
+    .Add("Revenue grew ")
+    .Add("18%", doc.DefaultStyle with { Bold = true, Color = PdfColor.FromHex("#15803d") })
+    .Add(" on the quarter, the third consecutive quarter of growth."));
+
+doc.Add(new KeepTogether(
+    new Paragraph("Outlook", doc.DefaultStyle with { Bold = true }) { SpaceBefore = 12, SpaceAfter = 4 },
+    new PanelBlock(new Paragraph("Guidance for the full year is unchanged.", muted)) { Background = PdfColor.Gray(0.95) }));
+
+// Empty when every character can be drawn in the fonts the document uses.
+IReadOnlyList<UnsupportedText> problems = doc.FindUnsupportedText();
+
+doc.Save("report.pdf");
+```
+
+## Fonts
+
+| | Standard (`StandardFont`) | TrueType (`TrueTypeFont`) |
+|---|---|---|
+| Embedded | Nothing — every reader has them | A subset of the glyphs you used |
+| Covers | WinAnsi: Western European | Whatever the font covers |
+| Licence | None applies | The font's own; see below |
+
+```csharp
+var family = PdfFontFamily.FromFiles("NotoSans-Regular.ttf", "NotoSans-Bold.ttf");
+var style = new TextStyle { Family = family, Size = 10 };
+```
+
+- **Only the glyphs you draw are embedded**, renumbered densely, so a 19 MB CJK font costs a few
+  kilobytes in the document. Each document keeps its own subset, so one loaded font can serve any
+  number of documents concurrently.
+- **Text stays searchable and copyable**: every embedded font carries a ToUnicode map.
+- **The font's embedding licence is honoured.** A font marked restricted is refused; a font
+  marked no-subsetting is embedded whole.
+- `.ttf` and `.ttc` collections (`TrueTypeFont.Load("msyh.ttc", collectionIndex: 0)`) are
+  supported. CFF-outline `.otf` files are refused with a clear message; most families also ship a
+  `.ttf`.
+- Text is set **one glyph per character**, with no kerning, ligatures or complex shaping. Latin,
+  Greek, Cyrillic and CJK print correctly. **Arabic, Hebrew and Indic scripts need shaping and
+  bidirectional layout, and will not render correctly** — use the HTML path for those.
+
+## Images
+
+```csharp
+PdfImage logo = PdfImage.FromFile("logo.png");
+(double w, double h) = logo.FitWithin(160, 60);
+```
+
+**JPEG** is embedded byte for byte — PDF decodes JPEG itself, so there is no quality loss and no
+decoder. Baseline and progressive, greyscale, RGB and CMYK, including Adobe's inverted CMYK.
+**PNG** is decoded and re-compressed, every colour type and bit depth, interlaced or not, and its
+**transparency is preserved** — a logo on a transparent background sits cleanly on any colour.
+An image drawn on every page is stored once.
+
+## Drawing directly
+
+`Theoistic.PDF.Writing` is the level everything above is built on: pages and the PDF drawing
+operators, for when you want exact control.
+
+```csharp
+using Theoistic.PDF.Writing;
+
+var document = new PdfDocument();
+PdfPage page = document.AddPage(PdfPaperSize.A4);
+
+page.Content
+    .SetFillColor(PdfColor.FromHex("#1f3a5f"))
+    .Rectangle(0, page.Height - 96, page.Width, 96)
+    .Fill();
+
+page.Content.DrawText("STATEMENT", StandardFont.HelveticaBold, 28, 56, page.Height - 56);
+
+// Text can be measured, so right-aligning is arithmetic rather than guesswork.
+const string total = "2,580.00";
+double width = StandardFont.HelveticaBold.GetTextWidth(total, 12);
+
+page.Content.DrawText(total, StandardFont.HelveticaBold, 12, page.Width - 56 - width, 200);
+page.Content.DrawImage(PdfImage.FromFile("logo.png"), 56, 120, 90, 30);
+
+byte[] pdf = document.ToArray();
+```
+
+- **Coordinates are PDF user space**: the origin is the **bottom-left** corner and y increases
+  upwards. The layout level is where top-down coordinates live.
+- **Output is deterministic.** Nothing timestamped or random is written unless you set it — even
+  font subset tags are derived, not random — so the same calls produce byte-identical files.
+
+## HTML to PDF
+
+When you already have HTML, or need what only a browser does — complex scripts, CSS grid, web
+fonts — `HtmlPdfBuilder` renders it with a Chromium-family browser already on the machine.
 
 Register the renderer once at startup. Both calls are needed: `AddTheoisticPDF` registers the
-services, `UseTheoisticPDF` lets the parameterless `PDFBuilder()` constructor find them.
+services, `UseTheoisticPDF` lets the parameterless `HtmlPdfBuilder()` constructor find them.
 
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
@@ -56,7 +388,7 @@ provider.UseTheoisticPDF();
 Then build a document:
 
 ```csharp
-using var pdfBuilder = new PDFBuilder();
+using var pdfBuilder = new HtmlPdfBuilder();
 
 byte[] pdf = await pdfBuilder
     .Settings(settings =>
@@ -91,50 +423,7 @@ if (!status.IsAvailable)
 (x86)\Microsoft\Edge\Application\msedge.exe)`), and says what it probed and failed to find when
 it does not.
 
-## Quick start — PDF without a browser
-
-`Theoistic.PDF.Writing` composes a document directly. No HTML, no browser, no external anything —
-useful for backends with no browser available, and for documents where you want exact control
-over placement.
-
-```csharp
-using Theoistic.PDF.Writing;
-
-var document = new PdfDocument();
-document.Info.Title = "Statement";
-
-PdfPage page = document.AddPage(PdfPaperSize.A4);
-
-page.Content
-    .SetFillColor(PdfColor.FromHex("#1f3a5f"))
-    .Rectangle(0, page.Height - 96, page.Width, 96)
-    .Fill();
-
-page.Content.DrawText("STATEMENT", StandardFont.HelveticaBold, 28, 56, page.Height - 56);
-
-// Text can be measured, so right-aligning is arithmetic rather than guesswork.
-const string total = "2,580.00";
-double width = StandardFont.HelveticaBold.GetTextWidth(total, 12);
-
-page.Content.DrawText(total, StandardFont.HelveticaBold, 12, page.Width - 56 - width, 200);
-
-byte[] pdf = document.ToArray();
-```
-
-Things worth knowing:
-
-- **Coordinates are PDF user space**: the origin is the **bottom-left** corner and y increases
-  upwards. Nothing flips the axis for you.
-- **Twelve standard typefaces** (Helvetica, Times, Courier × regular/bold/italic/bold-italic) are
-  available via `StandardFont`. They embed no font data, so no font licence applies to your
-  output. Metrics are exact for printable ASCII; accented Latin letters resolve through their
-  base letter.
-- **Text must be representable in WinAnsi.** Anything outside it throws rather than silently
-  dropping characters — use the HTML path for scripts the standard fonts cannot show.
-- **Output is deterministic.** Nothing timestamped or random is written unless you set it, so the
-  same calls produce byte-identical files.
-
-## Templating
+### HTML templates
 
 A small Mustache renderer is included, so you do not need a templating dependency:
 
@@ -147,7 +436,7 @@ It supports `{{value}}`, `{{#section}}` for lists and truthy checks, `{{^section
 sections, `{{.}}` for the current list item, and dotted paths like `{{#Order.Lines}}`. Inside a
 list section each item becomes the context, so its properties are referenced unqualified.
 
-## Styling
+### Styling
 
 `InjectCSS` points at a stylesheet on disk. The path is rewritten to an absolute `file://` URL and
 the link is inserted just above the closing `</head>`, which is what lets the stylesheet reach
@@ -166,7 +455,7 @@ nothing.
 By default the page is rendered as **screen** media. Set `WebSettings.PrintMediaType = true` to
 render print media instead, which is what activates your `@media print` rules.
 
-## Headers and footers
+### Headers and footers
 
 Set any of `Left`, `Center`, `Right` on `HeaderSettings` or `FooterSettings` and they are rendered
 as a three-column band. The old bracket placeholders are translated for you:
@@ -417,7 +706,42 @@ from the implementation.
 | Custom `@font-face` falls back | The stylesheet is not being applied at all — see above |
 | `N resource(s) failed to load` | A referenced asset 404'd. The message names the URLs. Set `LoadSettings.LoadErrorHandling = ContentErrorHandling.Ignore` to render anyway |
 | PDF title is `document.html` | The markup has no `<title>` and `DocumentTitle` was not set |
+| `PdfTextCoverageException` from a template | Text outside WinAnsi in the standard fonts. Set `InvoiceOptions.Fonts` to a TrueType family that covers it |
+| Arabic or Hebrew comes out disconnected or backwards | The non-browser levels do no shaping or bidirectional layout. Use `HtmlPdfBuilder` for those scripts |
+| `CFF-outline OpenType font` error | The `.otf` uses CFF outlines, which are not supported. Use the family's `.ttf` build |
 | Renders are slow | A browser is started on first use. Call `CheckAsync` at startup to pay that cost before the first request |
+
+## Upgrading from 1.x
+
+**2.0 is not backwards compatible with 1.x.** It is a fresh start: the rendering engine was
+replaced, the main type was renamed with no alias left behind, and the package no longer ships
+anything native. Existing 1.x code will not compile against it unchanged, and code that does
+compile can render differently. Plan the upgrade as a migration, not a version bump.
+
+| 1.x | 2.0 |
+|---|---|
+| `new PDFBuilder()` | `new HtmlPdfBuilder()` — renamed; `PDFBuilder` no longer exists |
+| wkhtmltopdf, bundled as native libraries for each platform | A Chrome, Edge or Chromium browser on the machine, or one reached through `RemoteAddress`. Nothing native is shipped |
+| Worked in any container with no setup | A container needs a browser and fonts installed, or a browser sidecar — see [Deployment](#deployment) |
+| Old WebKit layout | Current Chromium layout. Flexbox, grid and web fonts now work, so pages tuned around WebKit's quirks may look different |
+| `WkHtmlAttribute`, `ObjectSettings.GetContent()` | Removed; both existed only for the native interop |
+| `ColorMode`, `DPI`, `Outline` and other engine settings | Still compile, but ignored — see [Settings that a browser cannot honour](#settings-that-a-browser-cannot-honour) |
+| `InjectCSS` wrote `media="screen"` | Writes `media="all"`, so the stylesheet applies to the PDF |
+| HTML was the only way to make a document | Templates, flowing layout and direct drawing need no HTML and no browser |
+
+The quickest migration for code that only used `PDFBuilder` is a rename, plus making sure the
+deployment target has a browser:
+
+```csharp
+// 1.x
+using var builder = new PDFBuilder();
+
+// 2.0
+using var builder = new HtmlPdfBuilder();
+```
+
+If you only used HTML to produce invoices, consider moving to [the templates](#invoices)
+instead: no browser to install, and the totals are calculated for you.
 
 ## Contributing
 

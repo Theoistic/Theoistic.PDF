@@ -1,0 +1,71 @@
+# Publishes Theoistic.PDF to NuGet when a version tag is pushed:
+#
+#   git tag -a v2.0.0 -m "Theoistic.PDF 2.0.0"
+#   git push origin v2.0.0
+#
+# Needs a NuGet API key stored as the repository secret NUGET_API_KEY
+# (Settings > Secrets and variables > Actions). Nothing is published unless the tests pass.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # Windows, because the end-to-end tests drive Edge, which every Windows runner has. On the
+    # Ubuntu runners AppArmor blocks Chrome's sandbox, so those tests would fail for reasons that
+    # have nothing to do with the package.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            9.0.x
+            10.0.x
+
+      # A tag is easy to mistype and a NuGet version can never be reused, so the tag has to agree
+      # with the version the package will actually carry.
+      - name: Check the tag matches the package version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          [xml]$project = Get-Content Theoistic.PDF/Theoistic.PDF.csproj
+          $version = @($project.Project.PropertyGroup.PackageVersion | Where-Object { $_ })[0]
+          if ($tag -ne $version) {
+            Write-Error "Tag '$tag' does not match PackageVersion '$version' in Theoistic.PDF.csproj."
+            exit 1
+          }
+          Write-Host "Releasing $version"
+
+      - name: Test
+        run: dotnet test Theoistic.PDF.Tests/Theoistic.PDF.Tests.csproj --configuration Release
+
+      - name: Pack
+        run: dotnet pack Theoistic.PDF/Theoistic.PDF.csproj --configuration Release --output artifacts
+
+      # Kept on the run whether or not publishing succeeds, so a failed push can be retried by
+      # hand with exactly the package that passed the tests.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: artifacts/*.nupkg
+
+      - name: Publish to NuGet
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if (-not $env:NUGET_API_KEY) {
+            Write-Error "The NUGET_API_KEY secret is not set. Add it under Settings > Secrets and variables > Actions, then re-run this workflow."
+            exit 1
+          }
+          dotnet nuget push "artifacts/*.nupkg" --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate

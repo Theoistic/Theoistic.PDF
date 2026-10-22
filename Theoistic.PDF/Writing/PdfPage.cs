@@ -12,7 +12,8 @@ public sealed class PdfPage
 
     // Fonts are shared document-wide but named per page, because the resource name only has to
     // be unique within the page that uses it.
-    private readonly Dictionary<StandardFont, string> fontNames = new Dictionary<StandardFont, string>();
+    private readonly Dictionary<PdfFont, string> fontNames = new Dictionary<PdfFont, string>();
+    private readonly Dictionary<PdfImage, string> imageNames = new Dictionary<PdfImage, string>();
 
     internal PdfPage(
         PdfDocument document,
@@ -32,6 +33,8 @@ public sealed class PdfPage
 
     internal PdfDictionary Dictionary { get; }
 
+    internal PdfDocument Document => document;
+
     /// <summary>The page box, in points.</summary>
     public PdfRectangle MediaBox { get; }
 
@@ -46,7 +49,7 @@ public sealed class PdfPage
     /// Returns the resource name under which <paramref name="font"/> is reachable from this
     /// page's content stream, adding it to the resource dictionary on first use.
     /// </summary>
-    internal string GetFontResourceName(StandardFont font)
+    internal string GetFontResourceName(PdfFont font)
     {
         ArgumentNullException.ThrowIfNull(font);
 
@@ -63,8 +66,35 @@ public sealed class PdfPage
             resources.Set("Font", fonts);
         }
 
-        fonts.Set(name, document.GetFontObject(font));
+        fonts.Set(name, document.GetFontResource(font).Reference);
         fontNames[font] = name;
+
+        return name;
+    }
+
+    /// <summary>
+    /// Returns the resource name under which <paramref name="image"/> is reachable from this
+    /// page's content stream, adding it to the resource dictionary on first use.
+    /// </summary>
+    internal string GetImageResourceName(PdfImage image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+
+        if (imageNames.TryGetValue(image, out string? existing))
+        {
+            return existing;
+        }
+
+        string name = "Im" + (imageNames.Count + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        if (resources["XObject"] is not PdfDictionary images)
+        {
+            images = new PdfDictionary();
+            resources.Set("XObject", images);
+        }
+
+        images.Set(name, document.GetImageObject(image));
+        imageNames[image] = name;
 
         return name;
     }

@@ -10,7 +10,7 @@ namespace Theoistic.PDF.Tests;
 /// none is installed, because an absent browser is a property of the machine rather than a bug.
 /// </summary>
 [TestClass]
-public sealed class PDFBuilderTests
+public sealed class HtmlPdfBuilderTests
 {
     private const string Html = """
         <!DOCTYPE html>
@@ -80,7 +80,7 @@ public sealed class PDFBuilderTests
     public async Task BuildAsync_PassesTheHtmlToTheRenderer()
     {
         var stub = new StubRenderer();
-        using var builder = new PDFBuilder(stub);
+        using var builder = new HtmlPdfBuilder(stub);
 
         await builder.BuildAsync(Html);
 
@@ -92,7 +92,7 @@ public sealed class PDFBuilderTests
     public async Task BuildAsync_AppliesSettingsWithoutLosingDefaults()
     {
         var stub = new StubRenderer();
-        using var builder = new PDFBuilder(stub);
+        using var builder = new HtmlPdfBuilder(stub);
 
         await builder
             .Settings(s => s.Margins = new MarginSettings { Unit = Unit.Inches, Top = 1 })
@@ -109,7 +109,7 @@ public sealed class PDFBuilderTests
     public async Task BuildAsync_KeepsTheUtf8EncodingDefaultOnObjectSettings()
     {
         var stub = new StubRenderer();
-        using var builder = new PDFBuilder(stub);
+        using var builder = new HtmlPdfBuilder(stub);
 
         await builder.BuildAsync(Html, o => o.LoadSettings.JSDelay = 0);
 
@@ -123,7 +123,7 @@ public sealed class PDFBuilderTests
         string path = Path.Combine(Path.GetTempPath(), $"out-{Guid.NewGuid():N}.pdf");
         var stub = new StubRenderer();
 
-        using var builder = new PDFBuilder(stub);
+        using var builder = new HtmlPdfBuilder(stub);
 
         try
         {
@@ -146,7 +146,7 @@ public sealed class PDFBuilderTests
         await File.WriteAllTextAsync(css, "body { color: red }");
 
         var stub = new StubRenderer();
-        using var builder = new PDFBuilder(stub);
+        using var builder = new HtmlPdfBuilder(stub);
 
         try
         {
@@ -174,7 +174,7 @@ public sealed class PDFBuilderTests
         await File.WriteAllTextAsync(css, "body { color: red }");
 
         var stub = new StubRenderer();
-        using var builder = new PDFBuilder(stub);
+        using var builder = new HtmlPdfBuilder(stub);
 
         try
         {
@@ -196,7 +196,7 @@ public sealed class PDFBuilderTests
     [TestMethod]
     public void InjectCSS_RejectsAMissingFile()
     {
-        using var builder = new PDFBuilder(new StubRenderer());
+        using var builder = new HtmlPdfBuilder(new StubRenderer());
 
         Assert.ThrowsException<FileNotFoundException>(
             () => builder.InjectCSS(Path.Combine(Path.GetTempPath(), "no-such-file.css")));
@@ -210,7 +210,7 @@ public sealed class PDFBuilderTests
         await File.WriteAllTextAsync(css, "p { margin: 0 }");
 
         var stub = new StubRenderer();
-        using var builder = new PDFBuilder(stub);
+        using var builder = new HtmlPdfBuilder(stub);
 
         try
         {
@@ -227,7 +227,7 @@ public sealed class PDFBuilderTests
     [TestMethod]
     public async Task BuildAsync_RejectsNullHtml()
     {
-        using var builder = new PDFBuilder(new StubRenderer());
+        using var builder = new HtmlPdfBuilder(new StubRenderer());
 
         await Assert.ThrowsExceptionAsync<ArgumentNullException>(() => builder.BuildAsync(null!));
     }
@@ -235,7 +235,7 @@ public sealed class PDFBuilderTests
     [TestMethod]
     public async Task BuildAsync_AfterDisposeIsRejected()
     {
-        var builder = new PDFBuilder(new StubRenderer());
+        var builder = new HtmlPdfBuilder(new StubRenderer());
 
         builder.Dispose();
 
@@ -245,7 +245,7 @@ public sealed class PDFBuilderTests
     [TestMethod]
     public async Task BuildAsync_HonoursCancellation()
     {
-        using var builder = new PDFBuilder(new StubRenderer());
+        using var builder = new HtmlPdfBuilder(new StubRenderer());
         using var cancelled = new CancellationTokenSource();
 
         await cancelled.CancelAsync();
@@ -263,7 +263,7 @@ public sealed class PDFBuilderTests
 
         try
         {
-            InvalidOperationException error = Assert.ThrowsException<InvalidOperationException>(() => new PDFBuilder());
+            InvalidOperationException error = Assert.ThrowsException<InvalidOperationException>(() => new HtmlPdfBuilder());
 
             Assert.IsTrue(error.Message.Contains("AddTheoisticPDF", StringComparison.Ordinal), error.Message);
         }
@@ -321,7 +321,7 @@ public sealed class PDFBuilderTests
         RequireBrowser();
 
         await using var renderer = new ChromiumRenderer();
-        using var builder = new PDFBuilder(renderer);
+        using var builder = new HtmlPdfBuilder(renderer);
 
         AssertIsPdf(await builder.BuildAsync(Html));
     }
@@ -348,7 +348,7 @@ public sealed class PDFBuilderTests
         RequireBrowser();
 
         await using var renderer = new ChromiumRenderer();
-        using var builder = new PDFBuilder(renderer);
+        using var builder = new HtmlPdfBuilder(renderer);
 
         byte[] pdf = await builder.BuildAsync(
             """
@@ -369,7 +369,7 @@ public sealed class PDFBuilderTests
         // Each render gets its own tab on a shared browser, so these must not interfere.
         byte[][] results = await Task.WhenAll(Enumerable.Range(0, 4).Select(async i =>
         {
-            using var builder = new PDFBuilder(renderer);
+            using var builder = new HtmlPdfBuilder(renderer);
 
             return await builder.BuildAsync($"<html><body><h1>document {i}</h1></body></html>");
         }));
@@ -389,7 +389,7 @@ public sealed class PDFBuilderTests
 
         async Task<byte[]> BuildAsync(Orientation orientation)
         {
-            using var builder = new PDFBuilder(renderer);
+            using var builder = new HtmlPdfBuilder(renderer);
 
             return await builder
                 .Settings(s => s.Orientation = orientation)
@@ -416,7 +416,7 @@ public sealed class PDFBuilderTests
         RequireBrowser();
 
         await using var renderer = new ChromiumRenderer();
-        using var builder = new PDFBuilder(renderer);
+        using var builder = new HtmlPdfBuilder(renderer);
 
         byte[] pdf = await builder
             .Settings(s => s.DocumentTitle = "Quarterly report")
@@ -439,7 +439,7 @@ public sealed class PDFBuilderTests
         // has to stay something innocuous rather than a generated string, because it ends up in
         // the metadata of every document whose markup carries no title.
         await using var renderer = new ChromiumRenderer();
-        using var builder = new PDFBuilder(renderer);
+        using var builder = new HtmlPdfBuilder(renderer);
 
         byte[] pdf = await builder.BuildAsync("<html><body><p>no title element</p></body></html>");
 
@@ -463,7 +463,7 @@ public sealed class PDFBuilderTests
         await File.WriteAllTextAsync(css, "body { font-family: 'Courier New', monospace; }");
 
         await using var renderer = new ChromiumRenderer();
-        using var builder = new PDFBuilder(renderer);
+        using var builder = new HtmlPdfBuilder(renderer);
 
         try
         {

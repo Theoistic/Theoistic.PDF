@@ -16,6 +16,12 @@ public sealed class ContentStream
     private int saveDepth;
     private bool inTextObject;
 
+    // The font is graphics state, so it is saved and restored with the rest of it. Tracking it
+    // here is what lets ShowText encode for whichever font is actually current - a standard font
+    // takes one byte per character, an embedded one two bytes per glyph.
+    private PdfFont? currentFont;
+    private readonly Stack<PdfFont?> fontStack = new Stack<PdfFont?>();
+
     internal ContentStream(PdfPage page)
     {
         this.page = page;
@@ -34,6 +40,7 @@ public sealed class ContentStream
     public ContentStream Save()
     {
         saveDepth++;
+        fontStack.Push(currentFont);
 
         return Operator("q");
     }
@@ -48,6 +55,7 @@ public sealed class ContentStream
         }
 
         saveDepth--;
+        currentFont = fontStack.Pop();
 
         return Operator("Q");
     }
@@ -197,7 +205,7 @@ public sealed class ContentStream
     }
 
     /// <summary>Selects a font and size for subsequent text.</summary>
-    public ContentStream SetFont(StandardFont font, double size)
+    public ContentStream SetFont(PdfFont font, double size)
     {
         ArgumentNullException.ThrowIfNull(font);
 
@@ -208,6 +216,8 @@ public sealed class ContentStream
 
         writer.WriteName(page.GetFontResourceName(font));
         writer.WriteSpace();
+
+        currentFont = font;
 
         return Operands(size).Operator("Tf");
     }
@@ -238,8 +248,9 @@ public sealed class ContentStream
     public ContentStream NextLine() => Operator("T*");
 
     /// <summary>
-    /// Shows a string. The text is encoded as WinAnsi, matching the encoding declared on the
-    /// standard fonts, so characters outside Latin-1 are rejected rather than silently dropped.
+    /// Shows a string in the current font. A standard font can only show WinAnsi, and anything
+    /// outside it is rejected rather than silently dropped; an embedded font shows whatever its
+    /// file covers.
     /// </summary>
     public ContentStream ShowText(string text)
     {
@@ -251,7 +262,7 @@ public sealed class ContentStream
                 "ShowText is only valid inside a text object; call BeginText first.");
         }
 
-        writer.WriteString(StandardFont.Encode(text));
+        writer.WriteString(EncodeForCurrentFont(text));
 
         // A string is self-delimiting, so the separator is not strictly required, but every
         // other operand here is followed by one and the emitted stream is far easier to read.
@@ -282,7 +293,7 @@ public sealed class ContentStream
             switch (element)
             {
                 case string text:
-                    writer.WriteString(StandardFont.Encode(text));
+                    writer.WriteString(EncodeForCurrentFont(text));
                     break;
 
                 case double adjustment:
@@ -309,7 +320,7 @@ public sealed class ContentStream
     /// Draws a single run of text with its baseline at the given point, wrapping the font
     /// selection and text object so the caller does not have to.
     /// </summary>
-    public ContentStream DrawText(string text, StandardFont font, double size, double x, double y)
+    public ContentStream DrawText(string text, PdfFont font, double size, double x, double y)
     {
         ArgumentNullException.ThrowIfNull(text);
         ArgumentNullException.ThrowIfNull(font);
@@ -319,6 +330,47 @@ public sealed class ContentStream
             .SetTextPosition(x, y)
             .ShowText(text)
             .EndText();
+    }
+
+    // ---------------------------------------------------------------- images
+
+    /// <summary>
+    /// Draws an image into the rectangle whose lower-left corner is (<paramref name="x"/>,
+    /// <paramref name="y"/>). The image is stretched to the rectangle, so use
+    /// <see cref="PdfImage.FitWithin"/> to keep its proportions.
+    /// </summary>
+    public ContentStream DrawImage(PdfImage image, double x, double y, double width, double height)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+
+        if (width <= 0 || height <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width), "An image must be drawn at a positive size.");
+        }
+
+        if (inTextObject)
+        {
+            throw new InvalidOperationException("Images cannot be drawn inside a text object; call EndText first.");
+        }
+
+        // An image occupies the unit square in its own space, so the transform both places and
+        // sizes it. Wrapped in save and restore so the transform does not leak into what follows.
+        Save();
+        Transform(new PdfMatrix(width, 0, 0, height, x, y));
+
+        writer.WriteName(page.GetImageResourceName(image));
+        writer.WriteSpace();
+        Operator("Do");
+
+        return Restore();
+    }
+
+    private PdfString EncodeForCurrentFont(string text)
+    {
+        PdfFont font = currentFont ?? throw new InvalidOperationException(
+            "No font is selected; call SetFont before showing text.");
+
+        return page.Document.GetFontResource(font).Encode(text);
     }
 
     // ---------------------------------------------------------------- primitives

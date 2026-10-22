@@ -3,7 +3,12 @@ using Theoistic.PDF.Rendering;
 
 namespace Theoistic.PDF;
 
-public class PDFBuilder : IDisposable
+/// <summary>
+/// Renders HTML and CSS to PDF by driving an installed Chromium-family browser. For documents
+/// composed without HTML or a browser, see <see cref="Layout.FlowDocument"/> and the templates in
+/// <see cref="Templates"/>.
+/// </summary>
+public class HtmlPdfBuilder : IDisposable
 {
     private readonly IPdfRenderer renderer;
 
@@ -40,11 +45,11 @@ public class PDFBuilder : IDisposable
         }
     }
 
-    public PDFBuilder()
+    public HtmlPdfBuilder()
     {
         var services = TheoisticPDFExtensions.ServiceProvider
             ?? throw new InvalidOperationException(
-                "Theoistic.PDF has not been initialised. Call services.AddTheoisticPDF() and app.UseTheoisticPDF() during startup before creating a PDFBuilder.");
+                "Theoistic.PDF has not been initialised. Call services.AddTheoisticPDF() and app.UseTheoisticPDF() during startup before creating an HtmlPdfBuilder.");
 
         renderer = services.GetRequiredService<IPdfRenderer>();
     }
@@ -53,7 +58,7 @@ public class PDFBuilder : IDisposable
     /// Uses a renderer directly, for callers that resolve it themselves or want to substitute
     /// one in a test.
     /// </summary>
-    public PDFBuilder(IPdfRenderer renderer)
+    public HtmlPdfBuilder(IPdfRenderer renderer)
     {
         ArgumentNullException.ThrowIfNull(renderer);
 
@@ -64,7 +69,7 @@ public class PDFBuilder : IDisposable
     /// Configures the document-wide settings. The action mutates the defaults (A4, portrait,
     /// colour) rather than replacing them, so only what it touches changes.
     /// </summary>
-    public PDFBuilder Settings(Action<GlobalSettings> settings)
+    public HtmlPdfBuilder Settings(Action<GlobalSettings> settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
 
@@ -73,7 +78,7 @@ public class PDFBuilder : IDisposable
         return this;
     }
 
-    public PDFBuilder InjectCSS(string file)
+    public HtmlPdfBuilder InjectCSS(string file)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(file);
 
