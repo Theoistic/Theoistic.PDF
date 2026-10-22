@@ -83,5 +83,19 @@ jobs:
           # public on the package page, so it is not kept as a secret.
           user: Theoistic
 
+      # The packages are listed here rather than handed to dotnet nuget push as a wildcard: on
+      # Windows it does not expand "artifacts/*.nupkg" and reports that the file does not exist.
       - name: Publish to NuGet
-        run: dotnet nuget push "artifacts/*.nupkg" --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: |
+          $packages = @(Get-ChildItem -Path artifacts -Filter *.nupkg)
+          if ($packages.Count -eq 0) {
+            Write-Error "Pack produced no .nupkg in artifacts."
+            exit 1
+          }
+          foreach ($package in $packages) {
+            dotnet nuget push $package.FullName --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
