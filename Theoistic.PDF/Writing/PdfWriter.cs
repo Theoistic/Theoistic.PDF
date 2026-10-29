@@ -107,7 +107,7 @@ internal sealed class PdfWriter
 
         WriteByte((byte)'/');
 
-        foreach (byte b in Encoding.UTF8.GetBytes(value))
+        foreach (byte b in EncodeName(value))
         {
             if (IsRegularNameByte(b))
             {
@@ -119,6 +119,56 @@ internal sealed class PdfWriter
                 WriteRaw(b.ToString("X2", CultureInfo.InvariantCulture));
             }
         }
+    }
+
+    /// <summary>
+    /// The bytes of a name. Names are UTF-8 by convention, but one read from an existing file can
+    /// be any byte sequence - a font name in a legacy code page, say. The reader carries each byte
+    /// that is not valid UTF-8 as a lone surrogate from U+DC80 to U+DCFF, and those are turned back
+    /// into the original bytes here, so a name is written exactly as it was read. Rewriting it any
+    /// other way would break every content stream that selects a resource by that name.
+    /// </summary>
+    internal static byte[] EncodeName(string value)
+    {
+        bool carriesRawBytes = false;
+
+        for (int i = 0; i < value.Length && !carriesRawBytes; i++)
+        {
+            carriesRawBytes = IsRawByte(value, i);
+        }
+
+        if (!carriesRawBytes)
+        {
+            return Encoding.UTF8.GetBytes(value);
+        }
+
+        var bytes = new List<byte>(value.Length);
+        int runStart = 0;
+
+        for (int i = 0; i <= value.Length; i++)
+        {
+            if (i < value.Length && !IsRawByte(value, i))
+            {
+                continue;
+            }
+
+            bytes.AddRange(Encoding.UTF8.GetBytes(value[runStart..i]));
+
+            if (i < value.Length)
+            {
+                bytes.Add((byte)(value[i] - 0xDC00));
+            }
+
+            runStart = i + 1;
+        }
+
+        return bytes.ToArray();
+
+        // A low surrogate in that range is a carried byte only when it stands alone; preceded by
+        // a high surrogate it is half of an ordinary supplementary-plane character.
+        static bool IsRawByte(string text, int index) =>
+            text[index] >= '\uDC80' && text[index] <= '\uDCFF' &&
+            (index == 0 || !char.IsHighSurrogate(text[index - 1]));
     }
 
     public void WriteString(PdfString value)

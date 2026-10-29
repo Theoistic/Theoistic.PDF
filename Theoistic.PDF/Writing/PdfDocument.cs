@@ -374,7 +374,7 @@ public sealed class PdfDocumentInfo
     /// Formats a date in the PDF date syntax, whose offset uses an apostrophe separator rather
     /// than the colon that ISO 8601 would use.
     /// </summary>
-    private static string FormatDate(DateTimeOffset value)
+    internal static string FormatDate(DateTimeOffset value)
     {
         var text = new StringBuilder("D:");
 

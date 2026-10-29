@@ -63,9 +63,33 @@ public sealed class PdfReal : PdfObject
         Value = value;
     }
 
+    /// <summary>
+    /// A number read from an existing file, kept together with the text it was written as. Writing
+    /// it back reproduces that text exactly, where formatting <see cref="Value"/> would round it to
+    /// five decimals and could change a font matrix or a shading domain that needed more.
+    /// </summary>
+    internal PdfReal(double value, string literal)
+        : this(value)
+    {
+        Literal = literal;
+    }
+
     public double Value { get; }
 
-    internal override void Write(PdfWriter writer) => writer.WriteReal(Value);
+    /// <summary>The source text of a number read from a file; null for every number built in code.</summary>
+    internal string? Literal { get; }
+
+    internal override void Write(PdfWriter writer)
+    {
+        if (Literal is not null)
+        {
+            writer.WriteRaw(Literal);
+        }
+        else
+        {
+            writer.WriteReal(Value);
+        }
+    }
 }
 
 /// <summary>

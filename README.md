@@ -1,6 +1,7 @@
 # Theoistic.PDF
 
-PDF generation for .NET with **no bundled engine, no native binaries and no copyleft**.
+PDF generation, editing and signing for .NET with **no bundled engine, no native binaries and no
+copyleft**.
 
 The package is pure managed code. It ships nothing to install, downloads nothing at runtime, and
 carries no LGPL or AGPL obligations — which is unusual in this corner of the .NET ecosystem,
@@ -24,8 +25,12 @@ The non-browser levels embed TrueType fonts as subsets, so names like *Łukasz �
 has full browser fidelity, at the cost of needing a browser installed — **if you are deploying
 HTML rendering to Docker, Azure or DigitalOcean, read [Deployment](#deployment) first.**
 
+Existing PDFs can be opened too: filled in, extended with more pages, and sealed with a PAdES
+digital signature, all in managed code — see
+[Editing and signing existing PDFs](#editing-and-signing-existing-pdfs).
+
 - Targets `net9.0` and `net10.0`
-- Dependencies: `Microsoft.AspNetCore.Http.Abstractions`, `Microsoft.Extensions.DependencyInjection.Abstractions` — both MIT
+- Dependencies: `Microsoft.AspNetCore.Http.Abstractions`, `Microsoft.Extensions.DependencyInjection.Abstractions`, `System.Security.Cryptography.Pkcs` — all MIT, all Microsoft
 - Licence: MIT
 
 ## Install
@@ -33,6 +38,18 @@ HTML rendering to Docker, Azure or DigitalOcean, read [Deployment](#deployment) 
 ```bash
 dotnet add package Theoistic.PDF
 ```
+
+## What's new in 2.1
+
+| Feature | In one line | More |
+|---|---|---|
+| Open existing PDFs | `PdfEditor.Open(bytes)` — tables, cross-reference streams, object streams, damaged files repaired | [Editing and signing](#editing-and-signing-existing-pdfs) |
+| Draw on existing pages | `editor.DrawOn(0).Content.DrawText(...)` — in the coordinates you see, rotation and crop box handled | [Editing and signing](#editing-and-signing-existing-pdfs) |
+| Add pages to a document | `editor.AppendPages(flow.ToArray())`, `editor.AddPage(PdfPaperSize.A4)` | [Editing and signing](#editing-and-signing-existing-pdfs) |
+| Incremental saves | `editor.Save()` — the original bytes are kept exactly; everything new is appended | [Editing and signing](#editing-and-signing-existing-pdfs) |
+| PAdES digital signatures | `await PdfSigner.SignAsync(pdf, new PdfSignatureOptions { Certificate = cert })` — RSA or ECDSA | [Signing](#signing) |
+| Trusted timestamps | `TimestampAuthority = new Uri(...)` — an RFC 3161 timestamp on the signature (PAdES B-T) | [Signing](#signing) |
+| Signature verification | `PdfSignatureVerifier.Verify(pdf)` — every signature, and whether each still holds | [Verifying](#verifying) |
 
 ## What's new in 2.0
 
@@ -357,6 +374,108 @@ byte[] pdf = document.ToArray();
 - **Output is deterministic.** Nothing timestamped or random is written unless you set it — even
   font subset tags are derived, not random — so the same calls produce byte-identical files.
 
+## Editing and signing existing PDFs
+
+A form made in Word, a contract from a supplier, a government template: `PdfEditor` opens a PDF
+you did not make, so you can fill it in, add pages after it, and seal it with a digital
+signature. It is the same managed code as the rest of the package — no rendering engine, nothing
+native.
+
+```csharp
+using Theoistic.PDF.Editing;
+using Theoistic.PDF.Layout;
+using Theoistic.PDF.Writing;
+
+PdfEditor editor = PdfEditor.Open(File.ReadAllBytes("power-of-attorney.pdf"));
+
+PdfPage page = editor.DrawOn(0);
+page.Content.DrawText("Jóhanna Á. Hansen", StandardFont.Helvetica, 12, 84, 624);
+page.Content.DrawImage(PdfImage.FromFile("signature.png"), 312, 110, 150, 40);
+
+editor.AppendPages(new FlowDocument()
+    .Heading("Signing record")
+    .Paragraph("Filled in and signed through the HR portal.")
+    .ToArray());
+
+byte[] filledIn = editor.Save();
+```
+
+- **Nothing in the original is rewritten.** `Save` returns the original bytes, exactly as they
+  were, followed by one incremental update holding everything new. That is how PDF is designed to
+  be extended, and it is the only way that leaves a signature already in the file valid. With
+  nothing drawn or added, `Save` returns the original unchanged.
+- **Coordinates are the page as you see it.** `editor.Pages` reports each page the way a viewer
+  shows it — crop box applied, `/Rotate` applied, so a portrait page rotated by 90° reports a
+  landscape width and height — and `DrawOn` gives you a surface in exactly those coordinates,
+  origin bottom-left. Mapping that onto the page's own coordinate space is done for you.
+- **It is the ordinary drawing API.** `DrawOn` returns a normal `PdfPage`, so TrueType fonts are
+  embedded as subsets and PNG transparency is kept, as in a new document. The page's existing
+  content is wrapped so that whatever state it leaves behind — a transform, a clip, a colour —
+  cannot leak into what you draw.
+- `AddPage(width, height)` appends a blank page. `AppendPages(bytes)` appends every page of
+  another PDF, such as a `FlowDocument`; the pages keep their content, fonts and images, but not
+  their annotations or links.
+- The reader understands classic cross-reference tables, cross-reference streams, object
+  streams, the hybrid files Word writes, and chains of earlier updates, and it rebuilds a damaged
+  cross-reference table by scanning the file, as viewers do. **Encrypted PDFs are refused** with a
+  `PdfFormatException`, as is anything that is not a PDF.
+
+### Signing
+
+```csharp
+using System.Security.Cryptography.X509Certificates;
+
+using X509Certificate2 certificate = X509CertificateLoader.LoadPkcs12FromFile("seal.pfx", password);
+
+byte[] signed = await PdfSigner.SignAsync(filledIn, new PdfSignatureOptions
+{
+    Certificate = certificate,
+    Name = "Jóhanna Á. Hansen",
+    Reason = "I grant this power of attorney",
+    Location = "Tórshavn",
+});
+```
+
+The signature is a **PAdES baseline signature** (`/SubFilter /ETSI.CAdES.detached`): a
+detached CMS over the whole file, SHA-256, carrying the signing-certificate attribute that PAdES
+requires, with the signing time in the signature dictionary rather than inside the CMS. It is
+invisible — a signature field with no appearance, on the first page — and it is appended as one
+more incremental update.
+
+- RSA and ECDSA keys. Put intermediate certificates in `ExtraCertificates`, so a verifier can build
+  the chain without fetching anything.
+- Set `TimestampAuthority` to an RFC 3161 service — certificate providers run them — and the
+  signature carries a timestamp over its own value (PAdES B-T), proving it existed at that moment
+  whatever the signer's clock said. That request is the only network call the library ever makes,
+  and only when you ask for it.
+- With RSA and a fixed `SigningTime`, signing is deterministic too: the same input produces the
+  same signed file.
+- **A signed file can be extended and signed again.** Each signature covers the file as it was
+  when it was made, and an incremental update leaves that prefix alone, so every earlier signature
+  keeps verifying for its own revision. Verifiers do apply a modification policy on top, though:
+  adding another signature after someone has signed is fine, but drawing on a page or adding
+  pages after someone has signed is reported as a change to what they signed — pyHanko, for one,
+  rejects the earlier signature for it. **Draw and append first, then sign.**
+
+### Verifying
+
+```csharp
+foreach (PdfSignatureInfo signature in PdfSignatureVerifier.Verify(signed))
+{
+    Console.WriteLine(
+        $"{signature.FieldName}: {signature.Certificate?.Subject}, intact {signature.IntegrityValid}, " +
+        $"whole document {signature.CoversWholeDocument}");
+}
+```
+
+`Verify` lists every signature in the file, oldest first. `IntegrityValid` means the signed bytes
+are exactly what was signed and the signature checks out against the key of the certificate it
+carries. `CoversWholeDocument` is false for a signature followed by later updates — normal for
+every signature but the last, and worth a look when a document was meant to be final.
+
+**Whether to trust the certificate is your decision**, not the verifier's: build its chain with
+`X509Chain` against the roots you accept, or compare its thumbprint with the one you issued.
+
 ## HTML to PDF
 
 When you already have HTML, or need what only a browser does — complex scripts, CSS grid, web
@@ -519,8 +638,9 @@ deployment.
 
 ## Deployment
 
-The managed writer (`Theoistic.PDF.Writing`) needs nothing and runs anywhere. Everything below is
-about the **HTML path**.
+The managed writer (`Theoistic.PDF.Writing`), and the editing and signing built on it
+(`Theoistic.PDF.Editing`), need nothing and run anywhere. Everything below is about the **HTML
+path**.
 
 ### Windows and macOS, development and servers
 
@@ -710,6 +830,8 @@ from the implementation.
 | Arabic or Hebrew comes out disconnected or backwards | The non-browser levels do no shaping or bidirectional layout. Use `HtmlPdfBuilder` for those scripts |
 | `CFF-outline OpenType font` error | The `.otf` uses CFF outlines, which are not supported. Use the family's `.ttf` build |
 | Renders are slow | A browser is started on first use. Call `CheckAsync` at startup to pay that cost before the first request |
+| `PdfFormatException: The PDF is encrypted` | `PdfEditor`, `PdfSigner` and `PdfSignatureVerifier` do not decrypt. Save an unencrypted copy of the document first |
+| A validator rejects an earlier signature after the document was edited | Drawing on pages or appending pages after a signature changes what was signed, which modification policies do not allow. Do all editing first, then sign |
 
 ## Upgrading from 1.x
 

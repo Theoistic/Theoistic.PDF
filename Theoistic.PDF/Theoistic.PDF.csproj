@@ -4,14 +4,14 @@
 		<TargetFrameworks>net9.0;net10.0</TargetFrameworks>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<PackageVersion>2.0.0</PackageVersion>
+		<PackageVersion>2.1.0</PackageVersion>
 		<PackageId>Theoistic.PDF</PackageId>
 		<Title>Theoistic.PDF</Title>
 		<Authors>Theodor Solbjorg</Authors>
-		<Description>PDF generation for .NET with no bundled engine, no native binaries and no copyleft. Fill in an invoice and pick a template, lay out flowing documents with tables and pagination, or draw directly, all in pure managed code with embedded TrueType fonts and JPEG/PNG images. Or render HTML and CSS by driving a Chrome, Edge or Chromium browser already installed on the machine.</Description>
+		<Description>PDF generation, editing and signing for .NET with no bundled engine, no native binaries and no copyleft. Fill in an invoice and pick a template, lay out flowing documents with tables and pagination, or draw directly, all in pure managed code with embedded TrueType fonts and JPEG/PNG images. Open an existing PDF to draw on its pages, append pages and apply a PAdES digital signature as an incremental update, and verify the signatures a PDF carries. Or render HTML and CSS by driving a Chrome, Edge or Chromium browser already installed on the machine.</Description>
 		<PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
-		<PackageTags>pdf invoice html-to-pdf pdf-generation truetype aspnetcore</PackageTags>
+		<PackageTags>pdf invoice html-to-pdf pdf-generation truetype aspnetcore pdf-editing digital-signature pades esignature</PackageTags>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageProjectUrl>https://github.com/Theoistic/Theoistic.PDF</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/Theoistic/Theoistic.PDF</RepositoryUrl>
@@ -48,12 +48,20 @@
 		Pinned per target framework so a .NET 9 consumer is not dragged up to the 10.x
 		Microsoft.Extensions.* graph just by referencing this package.
 	-->
+	<!--
+		System.Security.Cryptography.Pkcs (CMS signatures and RFC 3161 timestamps, for signing) is
+		not part of Microsoft.NETCore.App, only of the ASP.NET Core and desktop shared frameworks,
+		so a console or worker consumer needs the package. Pinned per target framework for the same
+		reason as above; System.Formats.Asn1 is in the base framework and needs nothing.
+	-->
 	<ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.0" />
+		<PackageReference Include="System.Security.Cryptography.Pkcs" Version="9.0.22" />
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.1" />
+		<PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
 	</ItemGroup>
 
 </Project>
